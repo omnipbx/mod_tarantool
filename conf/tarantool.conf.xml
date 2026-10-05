@@ -1,0 +1,220 @@
+<configuration name="tarantool.conf" description="Tarantool Core DB driver">
+
+  <settings>
+    <!-- Behavior of the DDL translator for tables not covered by primaryKey/primaryKeyAdd sections.
+         add - inject a synthetic <table>_uuid PRIMARY KEY (default action);
+         none - pass through unchanged (Tarantool will reject CREATE TABLE without a primary key). -->
+    <param name="default-action" value="add"/>
+    <!-- NOTE: Tarantool 3.x does NOT evaluate expression DEFAULTs on INSERT
+         ("NOT NULL constraint failed" on a missing PK), so the module v1 does
+         not emit DEFAULT for injected PK columns at all — it injects uuid()
+         directly into every INSERT instead. The parameters below are kept as
+         documentation of the UUID generator per version branch. -->
+    <param name="primaryKeyAddDefault-3.2"  value="uuid()"/>
+    <param name="primaryKeyAddDefault-2.10" value="uuid()"/>
+    <!-- Reconnect / failover tuning. -->
+    <param name="reconnect-interval" value="5000"/>
+    <!-- Keep-alive probing of idle connections (ms). 0 disables ping-idle checks. -->
+    <param name="ping-idle" value="1000"/>
+    <param name="ping-timeout" value="500"/>
+    <!-- SQL tracing of every request (SQL-in from the core, SQL-out to
+         Tarantool). Can be toggled at runtime with 'tarantool debug'. -->
+    <param name="debug" value="false"/>
+  </settings>
+
+  <!-- TLS client profiles.
+       At most 16 <profile> entries; extras are ignored with a warning.
+       NOTE: server-side TLS on Tarantool Community Edition 3.x is not available
+       (iproto.ssl is Enterprise-only). Keep this section commented out unless you run
+       Tarantool Enterprise or terminate TLS with an external proxy (e.g. stunnel).
+  <tls>
+    <profile name="client-local-tls">
+      <param name="ca-file" value="$${conf_dir}/tls/ca.pem"/>
+      <param name="cert-file" value="$${conf_dir}/tls/client.crt"/>
+      <param name="key-file" value="$${conf_dir}/tls/client.key"/>
+      <param name="verify" value="true"/>
+      <param name="verify-host" value="true"/>
+      <param name="min-version" value="TLSv1.2"/>
+    </profile>
+  </tls>
+  -->
+
+  <profiles>
+    <!-- ============================================================
+         Default profile: single host (inline params).
+         Address priority: unix-socket -> host:port.
+         Version value is the Tarantool branch: "2.10" or "3.2".
+         Limits: at most 32 <profile> entries total and at most 8
+         <host> per <hosts>; extras are ignored with a warning.
+
+         skip-index="true" suppresses every CREATE INDEX issued by the
+         FreeSWITCH core / mod_sofia (indexes are then managed manually,
+         e.g. composite ones required by JOINs). Default: "false".
+         full-scan and init-sql are PROFILE-LEVEL parameters: they apply to
+         EVERY host of the profile (single-host and <hosts> alike, incl.
+         failover reconnects) and must be placed directly on <profile>,
+         NOT inside <host> (a host-level occurrence logs a warning).
+         full-scan="true" runs SET SESSION sql_full_scan=true (2.11/3.x,
+         fallback sql_seq_scan for older 2.x) on every connection; the
+         FreeSWITCH core issues full table scans (e.g. reactive schema
+         probes), which Tarantool rejects unless enabled per session.
+         Default: "true".
+         init-sql: arbitrary SQL executed right after connect ("" = none).
+         ============================================================ -->
+    <profile name="local" version="3.2" skip-index="false">
+      <param name="unix-socket" value="/run/tarantool/socket/tarantool-socket.control"/>
+      <!-- <param name="host" value="127.0.0.1"/>
+      <param name="port" value="3301"/> -->
+      <param name="user" value="freeswitch"/>
+      <param name="password" value="P@ssw0rd"/>
+      <param name="connect-timeout" value="2000"/>
+      <param name="query-timeout" value="3000"/>
+      <param name="full-scan" value="true"/>
+      <!-- <param name="init-sql" value="SET SESSION sql_full_scan=true"/> -->
+
+      <!-- ========================================================
+           Multi-host (failover) variant: uncomment <hosts> below.
+           The first reachable host is chosen at connect time;
+           switching happens only on network failures; retry after
+           failover applies to SELECT only; transactions stick to
+           one host. The 'role' attribute (master|replica|any) is a
+           v1.1 extension and is ignored in v1.
+           ========================================================
+      <hosts>
+        <host name="master-sock" version="3.2">
+          <param name="unix-socket" value="/var/lib/tarantool/socket/tarantool.control"/>
+          <param name="user" value="freeswitch"/>
+          <param name="password" value="P@ssw0rd"/>
+          <param name="query-timeout" value="3000"/>
+        </host>
+        <host name="replica-tcp" version="3.2">
+          <param name="host" value="127.0.0.1"/>
+          <param name="port" value="3302"/>
+          <param name="user" value="freeswitch"/>
+          <param name="password" value="P@ssw0rd"/>
+          <param name="query-timeout" value="3000"/>
+        </host>
+        <host name="replica-tls" version="3.2">
+          <param name="host" value="127.0.0.1"/>
+          <param name="port" value="3303"/>
+          <param name="user" value="freeswitch"/>
+          <param name="password" value="P@ssw0rd"/>
+          <param name="query-timeout" value="3000"/>
+          <param name="tls-profile" value="client-local-tls"/>
+        </host>
+      </hosts>
+      -->
+    </profile>
+  </profiles>
+
+  <!-- Words that must be double-quoted whenever the FreeSWITCH core uses
+       them as bare identifiers (Tarantool SQL rejects unquoted reserved
+       words). "uuid" and "alias" are built into the module as defaults;
+       list any ADDITIONAL word here without recompiling. The lexer quotes
+       an identifier only in identifier position (never inside string
+       literals, already-quoted identifiers, or function calls like uuid()). -->
+  <reserved>
+    <param name="uuid"/>
+    <param name="alias"/>
+    <!-- Examples for other schema columns:
+    <param name="key"/>
+    <param name="value"/>
+    -->
+  </reserved>
+
+  <!-- Declare an existing column as the PRIMARY KEY when translating CREATE TABLE. -->
+  <primaryKey>
+    <param table="channels" field="uuid"/>
+    <param table="recovery" field="uuid"/>
+    <param table="sip_authentication" field="nonce"/>
+  </primaryKey>
+
+  <!-- Add a synthetic PRIMARY KEY column (module-private, injected by the module).
+       Attributes:
+         type      - SQL column type: "varchar(36)" (default) or "uuid".
+                     varchar(N)/char/text/string are normalised to STRING on the wire;
+                     "uuid" produces a Tarantool UUID column (comparisons need CAST).
+         core-uuid - where the generated key value comes from:
+                       true  - FreeSWITCH core UUIDv7, injected into every INSERT
+                               (default when type is a string type; literal for
+                               varchar, CAST('...' AS UUID) for uuid columns);
+                       false - Tarantool-side uuid() generator (default when type
+                               is "uuid"); for string types this falls back to
+                               core-uuid with a warning (probe: plain uuid() is
+                               not accepted for string keys);
+                       (absent) - auto: string type -> true, uuid type -> false.
+       Omitted type/core-uuid attributes use the defaults above. -->
+  <primaryKeyAdd>
+    <param table="complete"      field="complete_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="aliases"       field="aliases_uuid"  type="varchar(36)" core-uuid="true"/>
+    <param table="calls"         field="calls_uuid"    type="varchar(36)" core-uuid="true"/>
+    <param table="interfaces"    field="interfaces_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="tasks"         field="tasks_uuid"    type="varchar(36)" core-uuid="true"/>
+    <param table="nat"           field="nat_uuid"      type="varchar(36)" core-uuid="true"/>
+    <param table="registrations" field="registrations_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="sip_registrations" field="sip_registrations_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="sip_presence"  field="sip_presence_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="sip_dialogs"   field="sip_dialogs_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="sip_subscriptions" field="sip_subscriptions_uuid" type="varchar(36)" core-uuid="true"/>
+  </primaryKeyAdd>
+
+  <!-- Add arbitrary extra columns to the given table.
+       Attributes:
+         type   - SQL column type passed through as-is ("varchar(36)" default;
+                  "uuid" implies CAST('...' AS UUID) on injection).
+         isNull - "true" (default) / "false" (adds NOT NULL).
+         default- column DEFAULT clause ("" = none; see the module README for
+                  why expression DEFAULTs are unreliable on Tarantool 3.x).
+         value  - value injected into every INSERT for this column:
+                    "$${var}" / "${var}" - resolved at runtime via
+                        switch_core_get_variable ONLY when in-line="true";
+                    other or no in-line  - treated as a literal (single-quoted,
+                        '' escaped); "" = no injection (column omitted).
+         in-line - "true": resolve $${global}/${var} from the environment
+                    before INSERT (unresolved values are inserted literally
+                    with a warning); absent/false: insert the value as-is. -->
+  <addField>
+    <!-- Were used for testing and as an example
+    <param table="recovery" field="switch_uuid" type="varchar(36)" isNull="false" value="$${switch_uuid}" in-line="true"/>
+    <param table="interfaces" field="switch_uuid" type="varchar(36)" isNull="false" value="$${switch_uuid}" in-line="true"/>
+    <param table="interfaces" field="switchs_uuid" type="varchar(36)" isNull="false" value="$${switchs_uuid}"/>
+    -->
+    <!-- Example with a native UUID column and a static literal:
+    <param table="nat" field="node_id" type="uuid" isNull="false" value="0189a000-0000-7000-8000-000000000000"/>
+    -->
+  </addField>
+
+  <!-- Tarantool has NO VIEW. The FreeSWITCH core and mod_commands issue
+       "select * from basic_calls / detailed_calls" (show calls etc.), which
+       fails with "Space 'basic_calls' does not exist". A <views> entry tells
+       the module to rewrite every core SELECT with "FROM <name>" into
+       "FROM (<body>) AS <name>". Put the PURE SELECT body here (without the
+       "create view ... as" prefix). Bodies must reference real tables only;
+       the final statement goes through the same reserved-word quoting as any
+       other SQL. Limit: 8 views, 4 KB body each. -->
+  <views>
+    <view name="basic_calls" description="mod_sofia"><![CDATA[select a.uuid as uuid,a.direction as direction,a.created as created,a.created_epoch as created_epoch,a.name as name,a.state as state,a.cid_name as cid_name,a.cid_num as cid_num,a.ip_addr as ip_addr,a.dest as dest,a.presence_id as presence_id,a.presence_data as presence_data,a.accountcode as accountcode,a.callstate as callstate,a.callee_name as callee_name,a.callee_num as callee_num,a.callee_direction as callee_direction,a.call_uuid as call_uuid,a.hostname as hostname,a.sent_callee_name as sent_callee_name,a.sent_callee_num as sent_callee_num,b.uuid as b_uuid,b.direction as b_direction,b.created as b_created,b.created_epoch as b_created_epoch,b.name as b_name,b.state as b_state,b.cid_name as b_cid_name,b.cid_num as b_cid_num,b.ip_addr as b_ip_addr,b.dest as b_dest,b.presence_id as b_presence_id,b.presence_data as b_presence_data,b.accountcode as b_accountcode,b.callstate as b_callstate,b.callee_name as b_callee_name,b.callee_num as b_callee_num,b.callee_direction as b_callee_direction,b.sent_callee_name as b_sent_callee_name,b.sent_callee_num as b_sent_callee_num,c.call_created_epoch as call_created_epoch from channels a left join calls c on a.uuid = c.caller_uuid and a.hostname = c.hostname left join channels b on b.uuid = c.callee_uuid and b.hostname = c.hostname where a.uuid = c.caller_uuid or a.uuid not in (select callee_uuid from calls)]]></view>
+    <view name="detailed_calls" description="mod_sofia"><![CDATA[select a.uuid as uuid,a.direction as direction,a.created as created,a.created_epoch as created_epoch,a.name as name,a.state as state,a.cid_name as cid_name,a.cid_num as cid_num,a.ip_addr as ip_addr,a.dest as dest,a.application as application,a.application_data as application_data,a.dialplan as dialplan,a.context as context,a.read_codec as read_codec,a.read_rate as read_rate,a.read_bit_rate as read_bit_rate,a.write_codec as write_codec,a.write_rate as write_rate,a.write_bit_rate as write_bit_rate,a.secure as secure,a.hostname as hostname,a.presence_id as presence_id,a.presence_data as presence_data,a.accountcode as accountcode,a.callstate as callstate,a.callee_name as callee_name,a.callee_num as callee_num,a.callee_direction as callee_direction,a.call_uuid as call_uuid,a.sent_callee_name as sent_callee_name,a.sent_callee_num as sent_callee_num,b.uuid as b_uuid,b.direction as b_direction,b.created as b_created,b.created_epoch as b_created_epoch,b.name as b_name,b.state as b_state,b.cid_name as b_cid_name,b.cid_num as b_cid_num,b.ip_addr as b_ip_addr,b.dest as b_dest,b.application as b_application,b.application_data as b_application_data,b.dialplan as b_dialplan,b.context as b_context,b.read_codec as b_read_codec,b.read_rate as b_read_rate,b.read_bit_rate as b_read_bit_rate,b.write_codec as b_write_codec,b.write_rate as b_write_rate,b.write_bit_rate as b_write_bit_rate,b.secure as b_secure,b.hostname as b_hostname,b.presence_id as b_presence_id,b.presence_data as b_presence_data,b.accountcode as b_accountcode,b.callstate as b_callstate,b.callee_name as b_callee_name,b.callee_num as b_callee_num,b.callee_direction as b_callee_direction,b.call_uuid as b_call_uuid,b.sent_callee_name as b_sent_callee_name,b.sent_callee_num as b_sent_callee_num,c.call_created_epoch as call_created_epoch from channels a left join calls c on a.uuid = c.caller_uuid and a.hostname = c.hostname left join channels b on b.uuid = c.callee_uuid and b.hostname = c.hostname where a.uuid = c.caller_uuid or a.uuid not in (select callee_uuid from calls)]]></view>
+  </views>
+
+  <!-- Periodic cleanup SQL (mod_sofia presence/BLF tables grow without TTL
+       trimming: keep them small so full-scan presence queries stay cheap).
+       Rules:
+         - enable="false" by default; the section is active ONLY when
+           enable="true" AND interval > 0 AND at least one <sql> references
+           an existing profile (otherwise it stays inactive with a WARNING);
+         - interval: seconds, clamped to [60, 3600]; 0 = disabled;
+         - one <sql> per profile; several statements may be chained with ';'
+           (they are split and executed one by one in the same session);
+         - ${now} is replaced with the current unixtime (Tarantool SQL has no
+           CURRENT_TIMESTAMP);
+         - cleanup runs only while mod_sofia is loaded; unreachable profiles
+           are skipped with a WARNING. -->
+  <maintenance interval="120" enable="false">
+    <!--
+    <sql profile="local"><![CDATA[delete from sip_presence where expires > 0 and expires <= ${now}; delete from sip_subscriptions where expires > 0 and expires <= ${now}]]></sql>
+    <sql profile="local"><![CDATA[delete from sip_registrations where expires > 0 and expires <= ${now}; delete from sip_dialogs where expires > 0 and expires <= ${now}]]></sql>
+    -->
+  </maintenance>
+
+</configuration>
