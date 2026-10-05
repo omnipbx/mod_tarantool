@@ -462,6 +462,16 @@ static char *translate_create_table(const tnt_rules_t *r, const tnt_stmt_t *st)
 			}
 		}
 	}
+	/* every def above ends with ',' — drop the dangling separator when
+	 * nothing follows it (no injected PK column, no addField, no PRIMARY
+	 * KEY clause), otherwise Tarantool sees "column INTEGER,)" and aborts
+	 * the CREATE TABLE with a syntax error. */
+	if (nseg > 0 &&
+		!((pa && !pkadd_defined) || (af && naf > 0) ||
+		  (!have_pk && (pk ? pk->field : (pa ? pa->field : NULL)) != NULL))) {
+		if (o > 0 && out[o - 1] == ',')
+			out[--o] = '\0';
+	}
 	/* inject the primary-key UUID column (only when the app did not).
 	 * No DEFAULT clause: Tarantool 3.x does NOT evaluate expression
 	 * defaults on INSERT ("NOT NULL constraint failed"); the module instead

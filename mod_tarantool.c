@@ -87,7 +87,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.1"
+#define TNT_VERSION	"1.0.2"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -441,10 +441,20 @@ static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 			const char *nm = switch_xml_attr(view, "name");
 			const char *body = switch_xml_txt(view);
 			size_t blen = body ? strlen(body) : 0;
+			char vreason[128];
 			int rc;
 			static const char *const a[] = { "name", NULL };
 
 			tnt_warn_unknown_attrs(view, a, "views/view");
+			/* a view body substitutes a whole VIEW: it must be ONE valid
+			 * SELECT — reject garbage / composite SQL with a console warning */
+			if (nm && body && tnt_sql_validate(body, 1, vreason, sizeof(vreason))) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <views> '%s': invalid SQL, "
+								  "view NOT applied: %s\n",
+								  nm, vreason);
+				continue;
+			}
 			rc = (nm && body) ? tnt_rules_add_view(&g->rules, nm, body) : -1;
 			if (rc == 0)
 				continue;
@@ -601,6 +611,18 @@ static void parse_maintenance(switch_xml_t cfg, tnt_global_t *g)
 			skipped++;
 			continue;
 		}
+		{
+			char mreason[128];
+
+			if (tnt_sql_validate(body, 0, mreason, sizeof(mreason))) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <maintenance> <sql> (profile '%s'): "
+								  "invalid SQL, entry NOT applied: %s\n",
+								  pr, mreason);
+				skipped++;
+				continue;
+			}
+		}
 		if (g->nmaint_sql >= TNT_MAINT_MAX) {
 			skipped++;
 			continue;
@@ -615,7 +637,7 @@ static void parse_maintenance(switch_xml_t cfg, tnt_global_t *g)
 	if (skipped) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 						  "mod_tarantool: <maintenance> dropped %d sql entry/entries "
-						  "(limit %d, unknown profile, empty or oversized body)\n",
+						  "(limit %d, unknown profile, empty, oversized or invalid SQL body)\n",
 						  skipped, TNT_MAINT_MAX);
 	}
 	g->maint_enabled = valid;
@@ -1050,39 +1072,37 @@ static int tnt_batch_is_cleanup_ddl(const tnt_stmt_t *stmts, int n)
 	return n > 0;
 }
 
-/* Execute a full SQL string (which may contain several statements).
- * Translates each statement, executes them sequentially as one batch on
- * the active host, and fills *res with the LAST result. */
-static switch_status_t tnt_exec_sql(tnt_handle_t *h, const char *sql,
-									tnt_result_t *res, char **err)
+/* Execute a list of already-split statements, each via its own
+ * IPROTO_EXECUTE. Tarantool SQL does NOT support multiple statements in a
+ * single execute, yet mod_sofia REQUIRES batch support (it probes with
+ * "stmt1;stmt2" at startup and refuses to start when the driver rejects
+ * the batch), so the driver must run the statements sequentially itself.
+ *
+ * When callback is non-NULL, every row of every SELECT is delivered to it
+ * right after the statement that produced it; otherwise *res keeps only the
+ * LAST statement's result (exec_detailed/exec_string contract). */
+static switch_status_t tnt_exec_statements(tnt_handle_t *h,
+										   const tnt_stmt_t *stmts, int n,
+										   switch_core_db_callback_func_t callback, void *pdata,
+										   tnt_result_t *res, char **err)
 {
-	tnt_stmt_t stmts[TNT_SQL_MAX_STMTS];
-	int n, i;
-	char *batch = NULL;
-	size_t blen = 0, bcap = 0;
-	int retryable = 1;
-	int ran = 0;
-	int rc;
+	int i, r;
+	int any_ran = 0;
+	int cleanup_ddl;
 	switch_status_t status = SWITCH_STATUS_SUCCESS;
 
 	memset(res, 0, sizeof(*res));
-
-	if (zstr(sql))
-		return SWITCH_STATUS_SUCCESS;
-
-	if (tnt_debug_active(h->profile_name))
-		tnt_debug_log(h->profile_name, "in", h->caller_file, h->caller_func, h->caller_line, sql);
-
-	n = tnt_sql_split(sql, stmts, TNT_SQL_MAX_STMTS);
+	cleanup_ddl = tnt_batch_is_cleanup_ddl(stmts, n);
 
 	for (i = 0; i < n; i++) {
 		char *out;
 		int noop = 0;
+		int rc;
+		int stmt_retryable;
 		tnt_translate_ctx_t ctx;
 		char uuidbuf[40];
 
-		if (stmts[i].type != TNT_STMT_SELECT && stmts[i].type != TNT_STMT_BEGIN)
-			retryable = 0;
+		stmt_retryable = (stmts[i].type == TNT_STMT_SELECT || stmts[i].type == TNT_STMT_BEGIN) ? 1 : 0;
 
 		/* skip-index=true: never run CREATE INDEX — indexes are managed
 		 * manually (e.g. composite ones for JOINs). */
@@ -1115,98 +1135,102 @@ static switch_status_t tnt_exec_sql(tnt_handle_t *h, const char *sql,
 			goto done;
 		}
 
-		/* append to batch buffer */
+		/* Quote Tarantool-reserved identifiers ('uuid', 'alias') in this
+		 * statement before it hits the server. Worst case is a doubling of
+		 * the size, so allocate strlen*2 + slack. */
 		{
-			size_t need = strlen(out) + 2;
-			char *nb;
+			size_t ncap = strlen(out) * 2 + 64;
+			const char *words[TNT_RESERVED_MAX];
+			int nwords = tnt_reserved_ptr_list(&h->rules, words, TNT_RESERVED_MAX);
+			char *nb = (char *)malloc(ncap);
 
-			if (blen + need > bcap) {
-				size_t ncap = bcap ? bcap * 2 : TNT_BATCH_INIT;
-
-				while (blen + need > ncap)
-					ncap *= 2;
-				nb = (char *)realloc(batch, ncap);
-				if (!nb) {
-					free(out);
-					if (err)
-						*err = strdup("mod_tarantool: out of memory building batch");
-					status = SWITCH_STATUS_FALSE;
-					goto done;
-				}
-				batch = nb;
-				bcap = ncap;
+			if (!nb) {
+				free(out);
+				if (err && *err == NULL)
+					*err = strdup("mod_tarantool: out of memory quoting statement");
+				status = SWITCH_STATUS_FALSE;
+				goto done;
 			}
-			memcpy(batch + blen, out, strlen(out));
-			blen += strlen(out);
-			batch[blen++] = ';';
-			batch[blen] = '\0';
+			tnt_sql_quote_reserved(out, nb, ncap, words, nwords);
+			free(out);
+			out = nb;
 		}
-		free(out);
-		ran = 1;
-	}
 
-	if (!ran) {
-		status = SWITCH_STATUS_SUCCESS;
-		goto done;
-	}
+		h->n_queries++;
+		if (tnt_debug_active(h->profile_name))
+			tnt_debug_log(h->profile_name, "out", h->caller_file, h->caller_func, h->caller_line, out);
 
-	/* Quote Tarantool-reserved identifiers ('uuid', 'alias') in the final
-	 * batch before it hits the server (both our translated DDL and the
-	 * core's DML must survive the parser). Worst case is a doubling of the
-	 * size, so allocate blen*2 + slack. */
-	{
-		size_t ncap = blen * 2 + 64;
-		char *nbatch = (char *)malloc(ncap);
-		const char *words[TNT_RESERVED_MAX];
-		int nwords = tnt_reserved_ptr_list(&h->rules, words, TNT_RESERVED_MAX);
-
-		if (!nbatch) {
-			if (err && *err == NULL)
-				*err = strdup("mod_tarantool: out of memory quoting batch");
-			status = SWITCH_STATUS_FALSE;
-			goto done;
-		}
-		tnt_sql_quote_reserved(batch, nbatch, ncap, words, nwords);
-		free(batch);
-		batch = nbatch;
-	}
-
-	h->n_queries += n;
-	if (tnt_debug_active(h->profile_name))
-		tnt_debug_log(h->profile_name, "out", h->caller_file, h->caller_func, h->caller_line, batch);
-
-	rc = tnt_session_execute(&h->session, batch, retryable, res);
-	if (rc == 1) {
-		/* deterministic SQL error: report unless benign */
-		if (tnt_rules_is_benign_error(res->error, tnt_batch_is_cleanup_ddl(stmts, n))) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-							  "mod_tarantool: benign error treated as success: [%s]\n", res->error);
-			status = SWITCH_STATUS_SUCCESS;
-		} else {
+		/* drop the previous statement's result; *res keeps the LAST one */
+		tnt_result_free(res);
+		rc = tnt_session_execute(&h->session, out, stmt_retryable, res);
+		if (rc == 1) {
+			/* deterministic SQL error: report unless benign */
+			if (cleanup_ddl && tnt_rules_is_benign_error(res->error, 1)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "mod_tarantool: benign error treated as success: [%s]\n", res->error);
+				free(out);
+				any_ran = 1;
+				continue;
+			}
 			/* surface the rejected SQL under 'tarantool debug on' — the core
 			 * (test_reactive) often hides the CREATE failure, leaving a
 			 * silent init loop */
 			if (tnt_debug_active(h->profile_name)) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-								  "mod_tarantool: SQL rejected [%s]: %s\n", batch, res->error);
+								  "mod_tarantool: SQL rejected [%s]: %s\n", out, res->error);
 			}
 			if (err && *err == NULL)
 				*err = strdup(res->error[0] ? res->error : "tarantool SQL error");
+			free(out);
 			status = SWITCH_STATUS_FALSE;
+			goto done;
+		} else if (rc < 0) {
+			if (err && *err == NULL)
+				*err = strdup(tnt_conn_last_error(&h->session.conn));
+			free(out);
+			status = SWITCH_STATUS_FALSE;
+			goto done;
+		} else {
+			h->affected_rows = res->affected_rows >= 0 ? res->affected_rows : 0;
+			if (callback && res->ncols > 0) {
+				for (r = 0; r < res->nrows; r++) {
+					if (callback(pdata, res->ncols, res->rows[r], res->col_name))
+						break;
+				}
+			}
 		}
-	} else if (rc < 0) {
-		if (err && *err == NULL)
-			*err = strdup(tnt_conn_last_error(&h->session.conn));
-		status = SWITCH_STATUS_FALSE;
-	} else {
-		h->affected_rows = res->affected_rows >= 0 ? res->affected_rows : 0;
-		status = SWITCH_STATUS_SUCCESS;
+		any_ran = 1;
+		free(out);
 	}
 
+	if (!any_ran)
+		status = SWITCH_STATUS_SUCCESS;
+
 done:
-	if (batch)
-		free(batch);
 	return status;
+}
+
+/* Execute a full SQL string (which may contain several statements).
+ * Splits it, runs every statement with its own IPROTO_EXECUTE (Tarantool
+ * has no multi-statement execute), and fills *res with the LAST result. */
+static switch_status_t tnt_exec_sql(tnt_handle_t *h, const char *sql,
+									tnt_result_t *res, char **err)
+{
+	tnt_stmt_t stmts[TNT_SQL_MAX_STMTS];
+	int n;
+	switch_status_t st;
+
+	memset(res, 0, sizeof(*res));
+
+	if (zstr(sql))
+		return SWITCH_STATUS_SUCCESS;
+
+	if (tnt_debug_active(h->profile_name))
+		tnt_debug_log(h->profile_name, "in", h->caller_file, h->caller_func, h->caller_line, sql);
+
+	n = tnt_sql_split(sql, stmts, TNT_SQL_MAX_STMTS);
+	st = tnt_exec_statements(h, stmts, n, NULL, NULL, res, err);
+	return st;
 }
 
 static switch_status_t tnt_exec_detailed(const char *file, const char *func, int line,
@@ -1315,8 +1339,9 @@ static switch_status_t tnt_callback_exec_detailed(const char *file, const char *
 {
 	tnt_handle_t *h;
 	tnt_result_t res;
+	tnt_stmt_t stmts[TNT_SQL_MAX_STMTS];
+	int n;
 	switch_status_t st;
-	int r;
 
 	if (!dih || !dih->handle)
 		return SWITCH_STATUS_FALSE;
@@ -1331,20 +1356,15 @@ static switch_status_t tnt_callback_exec_detailed(const char *file, const char *
 		h->caller_set = 1;
 	}
 
-	st = tnt_exec_sql(h, sql, &res, err);
-	if (st != SWITCH_STATUS_SUCCESS) {
-		tnt_result_free(&res);
-		return st;
-	}
+	if (tnt_debug_active(h->profile_name))
+		tnt_debug_log(h->profile_name, "in", h->caller_file, h->caller_func, h->caller_line, sql);
 
-	for (r = 0; r < res.nrows; r++) {
-		if (callback(pdata, res.ncols, res.rows[r], res.col_name)) {
-			break;
-		}
-	}
-
+	/* batch = several ';'-separated statements: deliver every row of every
+	 * SELECT to the callback (tnt_exec_statements does it inline) */
+	n = tnt_sql_split(sql, stmts, TNT_SQL_MAX_STMTS);
+	st = tnt_exec_statements(h, stmts, n, callback, pdata, &res, err);
 	tnt_result_free(&res);
-	return SWITCH_STATUS_SUCCESS;
+	return st;
 }
 
 /* ------------------------------------------------------------------ */

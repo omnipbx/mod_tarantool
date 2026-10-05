@@ -31,6 +31,7 @@
 #include "tnt_sql.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <string.h>
 
 static int is_ident_start(char c)
@@ -559,4 +560,149 @@ static int tnt_sql_is_keyword(const char *s, size_t len)
 			return 1;
 	}
 	return 0;
+}
+
+/* Lexical check of one statement span: unterminated string literals /
+	* comments and unbalanced parentheses. Returns 0 when the span is sound;
+	* reason (rcap bytes) carries the first problem found. */
+static int sql_span_ok(const char *sql, size_t start, size_t end,
+					   char *reason, size_t rcap)
+{
+	enum { ST_NORMAL, ST_SINGLE, ST_DOUBLE, ST_LINE, ST_BLOCK } st = ST_NORMAL;
+	size_t p = start;
+	int depth = 0;
+
+	while (p < end) {
+		char c = sql[p];
+
+		switch (st) {
+		case ST_NORMAL:
+			if (c == '\'') {
+				st = ST_SINGLE;
+			} else if (c == '"') {
+				st = ST_DOUBLE;
+			} else if (c == '-' && p + 1 < end && sql[p + 1] == '-') {
+				st = ST_LINE;
+				p++;
+			} else if (c == '/' && p + 1 < end && sql[p + 1] == '*') {
+				st = ST_BLOCK;
+				p++;
+			} else if (c == '(') {
+				depth++;
+			} else if (c == ')') {
+				if (depth > 0)
+					depth--;
+				else {
+					snprintf(reason, rcap, "unmatched ')'");
+					return -1;
+				}
+			}
+			break;
+		case ST_SINGLE:
+			if (c == '\'') {
+				if (p + 1 < end && sql[p + 1] == '\'')
+					p++;		/* escaped '' stays inside the literal */
+				else
+					st = ST_NORMAL;
+			}
+			break;
+		case ST_DOUBLE:
+			if (c == '"') {
+				if (p + 1 < end && sql[p + 1] == '"')
+					p++;
+				else
+					st = ST_NORMAL;
+			}
+			break;
+		case ST_LINE:
+			if (c == '\n')
+				st = ST_NORMAL;
+			break;
+		case ST_BLOCK:
+			if (c == '*' && p + 1 < end && sql[p + 1] == '/') {
+				st = ST_NORMAL;
+				p++;
+			}
+			break;
+		}
+		p++;
+	}
+	if (st == ST_SINGLE || st == ST_DOUBLE) {
+		snprintf(reason, rcap, "unterminated string literal");
+		return -1;
+	}
+	if (st == ST_BLOCK) {
+		snprintf(reason, rcap, "unterminated block comment");
+		return -1;
+	}
+	if (depth != 0) {
+		snprintf(reason, rcap, "unbalanced parentheses");
+		return -1;
+	}
+	return 0;
+}
+
+/* Lightweight config-time SQL validation (no server round-trip):
+	* - empty / comment-only input fails;
+	* - the string is split on top-level ';' and each statement is checked for
+	*   unterminated string literals/comments, unbalanced parentheses and an
+	*   unrecognized leading keyword;
+	* - want_select requires exactly one SELECT (the <views> bodies substitute
+	*   a missing Tarantool VIEW and must be pure single SELECTs).
+	* Returns 0 when valid; -1 otherwise, reason (reason_cap bytes,
+	* NUL-terminated) carries a human-readable cause. */
+SWITCH_DECLARE(int) tnt_sql_validate(const char *sql, int want_select,
+									 char *reason, size_t reason_cap)
+{
+	tnt_stmt_t stmts[TNT_SQL_MAX_STMTS];
+	char msg[192];
+	const char *q;
+	int n, i;
+
+	if (reason && reason_cap > 0)
+		reason[0] = '\0';
+
+	if (!sql) {
+		snprintf(msg, sizeof(msg), "empty SQL");
+	} else {
+		for (q = sql; *q && isspace((unsigned char)*q); q++)
+			;
+		if (!*q) {
+			snprintf(msg, sizeof(msg), "empty SQL");
+		} else {
+			n = tnt_sql_split(sql, stmts, TNT_SQL_MAX_STMTS);
+			if (n == 0) {
+				snprintf(msg, sizeof(msg), "no SQL statements found");
+			} else if (n == TNT_SQL_MAX_STMTS) {
+				snprintf(msg, sizeof(msg), "too many statements (>%d)", TNT_SQL_MAX_STMTS);
+			} else if (want_select && n != 1) {
+				snprintf(msg, sizeof(msg), "expected exactly one statement, got %d", n);
+			} else {
+				for (i = 0; i < n; i++) {
+					char tmp[160];
+
+					if (sql_span_ok(sql, stmts[i].start, stmts[i].end,
+									tmp, sizeof(tmp))) {
+						snprintf(msg, sizeof(msg), "statement %d: %s", i + 1, tmp);
+						break;
+					}
+					if (stmts[i].type == TNT_STMT_UNKNOWN) {
+						snprintf(msg, sizeof(msg),
+								 "statement %d: unrecognized SQL", i + 1);
+						break;
+					}
+					if (want_select && stmts[i].type != TNT_STMT_SELECT) {
+						snprintf(msg, sizeof(msg),
+								 "statement %d: expected SELECT", i + 1);
+						break;
+					}
+				}
+				if (i == n)
+					return 0;	/* all statements valid */
+			}
+		}
+	}
+	if (reason && reason_cap > 0)
+		snprintf(reason, reason_cap, "%s", msg);
+	return -1;
 }

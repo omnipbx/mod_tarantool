@@ -86,4 +86,14 @@ SWITCH_DECLARE(size_t) tnt_sql_find_keyword(const char *s, size_t len, const cha
 SWITCH_DECLARE(size_t) tnt_sql_quote_reserved(const char *src, char *dst, size_t dstcap,
 											  const char *const *words, int nwords);
 
+/* Lightweight config-time SQL validation (no server round-trip): splits the
+ * string on top-level ';' and rejects empty/comment-only input, too many
+ * statements, unterminated string literals/comments, unbalanced parentheses
+ * and statements with an unrecognized leading keyword. want_select requires
+ * exactly one SELECT statement (used by <views>, whose bodies substitute a
+ * missing Tarantool VIEW). Returns 0 when valid; -1 otherwise, reason
+ * (reason_cap bytes, NUL-terminated) carries a human-readable cause. */
+SWITCH_DECLARE(int) tnt_sql_validate(const char *sql, int want_select,
+									 char *reason, size_t reason_cap);
+
 #endif /* TNT_SQL_H */

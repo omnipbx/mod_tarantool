@@ -156,6 +156,8 @@
     <param table="sip_presence"  field="sip_presence_uuid" type="varchar(36)" core-uuid="true"/>
     <param table="sip_dialogs"   field="sip_dialogs_uuid" type="varchar(36)" core-uuid="true"/>
     <param table="sip_subscriptions" field="sip_subscriptions_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="sip_shared_appearance_dialogs" field="sip_shared_appearance_dialogs_uuid" type="varchar(36)" core-uuid="true"/>
+    <param table="sip_shared_appearance_subscriptions" field="sip_shared_appearance_subscriptions_uuid" type="varchar(36)" core-uuid="true"/>
   </primaryKeyAdd>
 
   <!-- Add arbitrary extra columns to the given table.
@@ -191,7 +193,9 @@
        "FROM (<body>) AS <name>". Put the PURE SELECT body here (without the
        "create view ... as" prefix). Bodies must reference real tables only;
        the final statement goes through the same reserved-word quoting as any
-       other SQL. Limit: 8 views, 4 KB body each. -->
+       other SQL. Bodies are VALIDATED at load time (must be exactly one
+       well-formed SELECT): invalid SQL is rejected with a warning and is
+       NOT applied. Limit: 8 views, 4 KB body each. -->
   <views>
     <view name="basic_calls" description="mod_sofia"><![CDATA[select a.uuid as uuid,a.direction as direction,a.created as created,a.created_epoch as created_epoch,a.name as name,a.state as state,a.cid_name as cid_name,a.cid_num as cid_num,a.ip_addr as ip_addr,a.dest as dest,a.presence_id as presence_id,a.presence_data as presence_data,a.accountcode as accountcode,a.callstate as callstate,a.callee_name as callee_name,a.callee_num as callee_num,a.callee_direction as callee_direction,a.call_uuid as call_uuid,a.hostname as hostname,a.sent_callee_name as sent_callee_name,a.sent_callee_num as sent_callee_num,b.uuid as b_uuid,b.direction as b_direction,b.created as b_created,b.created_epoch as b_created_epoch,b.name as b_name,b.state as b_state,b.cid_name as b_cid_name,b.cid_num as b_cid_num,b.ip_addr as b_ip_addr,b.dest as b_dest,b.presence_id as b_presence_id,b.presence_data as b_presence_data,b.accountcode as b_accountcode,b.callstate as b_callstate,b.callee_name as b_callee_name,b.callee_num as b_callee_num,b.callee_direction as b_callee_direction,b.sent_callee_name as b_sent_callee_name,b.sent_callee_num as b_sent_callee_num,c.call_created_epoch as call_created_epoch from channels a left join calls c on a.uuid = c.caller_uuid and a.hostname = c.hostname left join channels b on b.uuid = c.callee_uuid and b.hostname = c.hostname where a.uuid = c.caller_uuid or a.uuid not in (select callee_uuid from calls)]]></view>
     <view name="detailed_calls" description="mod_sofia"><![CDATA[select a.uuid as uuid,a.direction as direction,a.created as created,a.created_epoch as created_epoch,a.name as name,a.state as state,a.cid_name as cid_name,a.cid_num as cid_num,a.ip_addr as ip_addr,a.dest as dest,a.application as application,a.application_data as application_data,a.dialplan as dialplan,a.context as context,a.read_codec as read_codec,a.read_rate as read_rate,a.read_bit_rate as read_bit_rate,a.write_codec as write_codec,a.write_rate as write_rate,a.write_bit_rate as write_bit_rate,a.secure as secure,a.hostname as hostname,a.presence_id as presence_id,a.presence_data as presence_data,a.accountcode as accountcode,a.callstate as callstate,a.callee_name as callee_name,a.callee_num as callee_num,a.callee_direction as callee_direction,a.call_uuid as call_uuid,a.sent_callee_name as sent_callee_name,a.sent_callee_num as sent_callee_num,b.uuid as b_uuid,b.direction as b_direction,b.created as b_created,b.created_epoch as b_created_epoch,b.name as b_name,b.state as b_state,b.cid_name as b_cid_name,b.cid_num as b_cid_num,b.ip_addr as b_ip_addr,b.dest as b_dest,b.application as b_application,b.application_data as b_application_data,b.dialplan as b_dialplan,b.context as b_context,b.read_codec as b_read_codec,b.read_rate as b_read_rate,b.read_bit_rate as b_read_bit_rate,b.write_codec as b_write_codec,b.write_rate as b_write_rate,b.write_bit_rate as b_write_bit_rate,b.secure as b_secure,b.hostname as b_hostname,b.presence_id as b_presence_id,b.presence_data as b_presence_data,b.accountcode as b_accountcode,b.callstate as b_callstate,b.callee_name as b_callee_name,b.callee_num as b_callee_num,b.callee_direction as b_callee_direction,b.call_uuid as b_call_uuid,b.sent_callee_name as b_sent_callee_name,b.sent_callee_num as b_sent_callee_num,c.call_created_epoch as call_created_epoch from channels a left join calls c on a.uuid = c.caller_uuid and a.hostname = c.hostname left join channels b on b.uuid = c.callee_uuid and b.hostname = c.hostname where a.uuid = c.caller_uuid or a.uuid not in (select callee_uuid from calls)]]></view>
@@ -208,6 +212,9 @@
            (they are split and executed one by one in the same session);
          - ${now} is replaced with the current unixtime (Tarantool SQL has no
            CURRENT_TIMESTAMP);
+         - each <sql> body is VALIDATED at load time (statement count, quote/
+           paren balance, recognized keywords): invalid SQL is rejected with
+           a warning and is NOT applied;
          - cleanup runs only while mod_sofia is loaded; unreachable profiles
            are skipped with a WARNING. -->
   <maintenance interval="120" enable="false">
