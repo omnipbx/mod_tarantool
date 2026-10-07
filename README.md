@@ -14,7 +14,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.2)
+## Возможности (v1.0.3)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -410,6 +410,36 @@ Tarantool SQL не позволяет использовать зарезерв�
 (`"alias"` — это та же колонка `alias`). Лимит словаря — 32 слова; при
 превышении лишние слова игнорируются с предупреждением в лог.
 
+### `<intColumns>` — числовые колонки со строковыми значениями
+
+FreeSWITCH форматирует часть целочисленных полей **в кавычках**: например,
+`created_epoch` уходит в SQL как `'1791322069'` (формат `'%ld'` в
+[`switch_core_sqldb.c`](../src/switch_core_sqldb.c:2478)). Tarantool не делает
+неявную конвертацию string→integer при INSERT/UPDATE, и запись падает с
+`Type mismatch: can not convert string('...') to integer`. Секция объявляет,
+какие поля могут приходить в таком виде:
+
+```xml
+<intColumns>
+  <param table="channels" field="created_epoch" type="INTEGER"/>
+  <param table="calls"    field="call_created_epoch" type="INTEGER"/>
+</intColumns>
+```
+
+Правила:
+
+- на INSERT/UPDATE значение-строковый литерал `'…'` для объявленной колонки
+  переписывается в `CAST('…' AS <тип>)`; пустая строка `''` → `NULL`;
+- голые числа (`expires = 1700000000`), `NULL`, `uuid()` и выражения не трогаются;
+- строковые колонки никогда не затрагиваются (справочник «таблица/поле»);
+- тип проверяется при `load`/`tarantool reload`: незнакомое имя → WARNING в
+  консоль и запись игнорируется; допустимые типы:
+  `INTEGER|INT|BIGINT|SMALLINT|TINYINT|MEDIUMINT` → `INTEGER`,
+  `NUMBER` → `NUMBER`, `DOUBLE|REAL|FLOAT` → `DOUBLE`,
+  `DECIMAL|NUMERIC` → `DECIMAL`;
+- лимит: 64 записи (`TNT_INTCOL_MAX`), превышение — WARNING + игнор;
+  дубликаты «таблица+поле» дедуплицируются.
+
 ### `<views>` — эмуляция VIEW (Tarantool их не имеет)
 
 `show calls`, `show detailed_calls`, `show bridged_calls` и реактивные зонды
@@ -504,6 +534,39 @@ view из-за усечения — после исправления разме
 - поток стартует в `mod_tarantool_load`, останавливается в `mod_tarantool_shutdown`;
   изменения `enable`/`interval`/списка подхватываются со следующей итерации
   (`tarantool reload` без перезагрузки модуля).
+
+### `tarantool reload` — что применяется, а что нет
+
+`reload` полностью перечитывает `tarantool.conf.xml`; при любой ошибке
+(включая незнакомые типы в `<intColumns>`) конфиг **не применяется вообще** —
+остаётся старый рабочий, в консоль пишется CRIT/WARNING. Далее:
+
+**Применяется к АКТИВНЫМ соединениям сразу (hot-reload):**
+
+- все секции правил — `<reserved>`, `<views>`, `<primaryKey>`/`<primaryKeyAdd>`,
+  `<addField>`, `<intColumns>`. Они лежат в одной структуре `tnt_rules_t`,
+  поэтому заменяются **оптом** (одним присваиванием) на каждом открытом хендле
+  под его собственной блокировкой: текущий SQL-вызов (весь батч) не рвётся,
+  а следующий запрос любого активного соединения уже транслируется по новой
+  конфигурации. В лог: `rules hot-applied to N active connection(s)`.
+
+**Применяется на лету при `reload`:**
+
+- `<maintenance>` (`enable`/`interval`/`<sql>`) — `reload` будит фоновый поток
+  (флаг wake-up), тот немедленно перечитывает снапшот под мьютексом и запускает
+  итерацию с новыми параметрами (латентность ≤ 250 мс); `${now}` всегда свежий
+  на момент выполнения. Полная остановка/перезапуск потока не нужны — он
+  запущен всегда и просто «простаивает», пока секция выключена;
+- `<settings>` `default-action`, тайминги `ping-idle`/`ping-timeout` —
+  со следующего использования/подключения.
+
+**НЕ применяется к активным соединениям (только к новым):**
+
+- `<profiles>` (`<profile>`/`<hosts>`: адреса, порты, учётные данные, таймауты
+  подключения, `skip-index`, `full-scan`, `init-sql`) и `<tls>` — соединение
+  уже открыто со своей копией профиля; чтобы применить, нужен перезапуск
+  FreeSWITCH (или дождаться, пока пул создаст новые хендлы);
+- `debug` управляется отдельно и мгновенно: `tarantool debug on|off [profile]`.
 
 ### Прочие правила трансляции DDL
 
@@ -633,9 +696,9 @@ local: 1/2 hosts up
 
 ```
 [0] profile=local fd=23 unix:/var/lib/tarantool/socket/tarantool.control:3301 v3.2 cur=0 queries=842
-    caller=sofia_reg.c:2578 sofia_reg_handle_sip_r_register idle=12ms auto_commit=true last_affected=1 age=3600s
+    caller=sofia_reg.c:2578 sofia_reg_handle_sip_r_register idle=12ms auto_commit=true last_affected=1 age=36s
 [1] profile=local fd=24 unix:/var/lib/tarantool/socket/tarantool.control:3301 v3.2 cur=0 queries=57
-    caller=switch_core_sqldb.c:2829 switch_core_db_handle_new idle=800ms auto_commit=true last_affected=-1 age=3600s
+    caller=switch_core_sqldb.c:2829 switch_core_db_handle_new idle=800ms auto_commit=true last_affected=-1 age=1d 02:03:04
 2 connection(s), 2 up
 ```
 

@@ -97,6 +97,28 @@ typedef struct tnt_addfield_rule {
 	char value[128];		/* value injected on INSERT */
 } tnt_addfield_rule_t;
 
+/* Numeric columns whose values may arrive as QUOTED string literals
+ * ('1791322069') from the FreeSWITCH core: channels.created_epoch and
+ * calls.call_created_epoch are formatted by switch_core_sqldb.c as '%ld'
+ * INSIDE single quotes. Tarantool does not coerce string->number, so such
+ * literals are rewritten to CAST('...' AS <type>) on INSERT/UPDATE. The
+ * <intColumns> config section declares exactly which (table, field) pairs
+ * can show this variation; only those columns are ever touched. */
+#define TNT_INTCOL_MAX	64
+
+typedef struct tnt_intcol_rule {
+	char table[64];
+	char field[64];
+	char type[16];			/* canonical CAST target (INTEGER/NUMBER/DOUBLE/DECIMAL) */
+} tnt_intcol_rule_t;
+
+/* Recognized numeric type names for <intColumns type="..."> and their
+ * CAST(... AS ...) targets (Tarantool SQL). */
+typedef struct tnt_intcol_type {
+	const char *name;		/* value accepted in the config */
+	const char *cast;		/* CAST(... AS <cast>) target */
+} tnt_intcol_type_t;
+
 typedef struct tnt_rules {
 	tnt_pk_rule_t pk[TNT_RULES_MAX];
 	int npk;
@@ -108,6 +130,8 @@ typedef struct tnt_rules {
 	int nreserved;			/* "uuid" and "alias" pre-loaded by tnt_rules_init */
 	tnt_view_rule_t views[TNT_VIEWS_MAX];
 	int nviews;
+	tnt_intcol_rule_t intcols[TNT_INTCOL_MAX];
+	int nintcols;
 	char uuid_default[64];		/* e.g. "uuid7()" (3.x) or "uuid()" (2.10) */
 } tnt_rules_t;
 
@@ -142,6 +166,18 @@ SWITCH_DECLARE(int) tnt_rules_add_reserved(tnt_rules_t *r, const char *word);
  *  -3  - TNT_VIEWS_MAX reached: the extra view is ignored (non-fatal).
  * No truncation happens: an oversized body is rejected, never cut. */
 SWITCH_DECLARE(int) tnt_rules_add_view(tnt_rules_t *r, const char *name, const char *body);
+
+/* Add an <intColumns> entry. type must be a recognized numeric type (see
+ * tnt_intcol_cast_for_type); duplicates (table+field) are ignored.
+ * Returns 0 on success, -1 when invalid (empty names/type) or the
+ * TNT_INTCOL_MAX limit is reached. */
+SWITCH_DECLARE(int) tnt_rules_add_intcol(tnt_rules_t *r, const char *table,
+										 const char *field, const char *type);
+
+/* Canonical CAST target ("INTEGER", "NUMBER", "DOUBLE" or "DECIMAL") for a
+ * recognized numeric type name ("BIGINT", "REAL", ...) used by <intColumns>;
+ * NULL when the type is unknown. Used for config-time validation. */
+SWITCH_DECLARE(const char *) tnt_intcol_cast_for_type(const char *type);
 
 /* Translate a single statement. Returns a malloc'ed translated SQL string
  * (NUL-terminated, containing only this statement) or NULL when:

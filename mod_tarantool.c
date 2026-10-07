@@ -87,7 +87,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.2"
+#define TNT_VERSION	"1.0.3"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -99,6 +99,7 @@ typedef struct tnt_handle {
 	char profile_name[64];
 	tnt_profile_cfg_t profile;	/* deep copy at handle_new time */
 	tnt_rules_t rules;			/* deep copy at handle_new time */
+	switch_mutex_t *lock;		/* serializes SQL calls vs the reload rules swap */
 	tnt_session_t session;
 	switch_bool_t auto_commit;
 	int affected_rows;
@@ -127,6 +128,7 @@ typedef struct tnt_tls_profile {
 
 typedef struct tnt_global {
 	switch_mutex_t *mutex;
+	switch_memory_pool_t *pool;	/* module pool (load-time), used for handle locks */
 	tnt_profile_cfg_t profiles[TNT_PROFILES_MAX];
 	int nprofiles;
 	tnt_tls_profile_t tls_profiles[TNT_PROFILES_TLS_MAX];
@@ -149,6 +151,10 @@ typedef struct tnt_global {
 } tnt_global_t;
 
 static tnt_global_t *glob = NULL;
+
+/* Set by a successful reload so the <maintenance> thread re-reads the config
+ * immediately (enable/interval/<sql> hot-applied, latency <= 250 ms). */
+static int maint_wakeup = 0;
 
 /* Set while parsing when a <views> body exceeds TNT_VIEW_BODY_LEN. Such a
  * configuration must be REJECTED as a whole: on load the module refuses to
@@ -427,6 +433,35 @@ static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 								  "mod_tarantool: <reserved> word '%s' ignored "
 								  "(empty or limit %d reached)\n",
 								  nm, TNT_RESERVED_MAX);
+			}
+		}
+	}
+
+	/* <intColumns>: numeric columns that may arrive as QUOTED string literals
+	 * ('1791322069') from the FreeSWITCH core. The type attribute is checked
+	 * at load/reload time — an unknown type is reported to the console and
+	 * the entry is skipped. */
+	for (sec = switch_xml_child(xml, "intColumns"); sec; sec = sec->next) {
+		for (param = switch_xml_child(sec, "param"); param; param = param->next) {
+			const char *tb = switch_xml_attr(param, "table");
+			const char *fd = switch_xml_attr(param, "field");
+			const char *ty = switch_xml_attr(param, "type");
+			static const char *const a[] = { "table", "field", "type", NULL };
+
+			tnt_warn_unknown_attrs(param, a, "intColumns");
+			if (!ty || !tnt_intcol_cast_for_type(ty)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <intColumns> %s.%s: unknown type '%s' "
+								  "(INTEGER/INT/BIGINT/SMALLINT/TINYINT/MEDIUMINT/NUMBER/"
+								  "DOUBLE/REAL/FLOAT/DECIMAL/NUMERIC), entry ignored\n",
+								  tb ? tb : "?", fd ? fd : "?", ty ? ty : "(missing)");
+				continue;
+			}
+			if (tnt_rules_add_intcol(&g->rules, tb, fd, ty) != 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <intColumns> %s.%s ignored "
+								  "(empty names or limit %d reached)\n",
+								  tb ? tb : "?", fd ? fd : "?", TNT_INTCOL_MAX);
 			}
 		}
 	}
@@ -823,6 +858,10 @@ static switch_xml_t tnt_cfg_open(void)
 	return xml;
 }
 
+/* Pick the UUID default for a host version branch; defined near
+ * tnt_handle_new, forward-declared for use by the config_load hot-reload. */
+static void tnt_rules_set_uuid_default(tnt_rules_t *r, const tnt_profile_cfg_t *p);
+
 /* re-read configuration into a fresh snapshot (used by load and reload).
  * All heavy structures (profiles, TLS profiles, rules incl. view bodies)
  * live on the heap inside *ng; the swap below copies them straight into
@@ -832,6 +871,7 @@ static switch_status_t config_load(void)
 {
 	switch_xml_t cfg = NULL;
 	tnt_global_t *ng;
+	int hi;
 
 	tnt_cfg_view_fatal = 0;		/* re-arm for every parse attempt */
 	if (!(cfg = tnt_cfg_open()))
@@ -864,12 +904,37 @@ static switch_status_t config_load(void)
 			 ng->uuid_default_32[0] ? ng->uuid_default_32 : "uuid7()");
 	snprintf(glob->uuid_default_210, sizeof(glob->uuid_default_210), "%s",
 			 ng->uuid_default_210[0] ? ng->uuid_default_210 : "uuid()");
+
+	/* hot-reload: push the new rules snapshot into every ACTIVE connection.
+	 * All rule sections (reserved/views/primaryKey/intColumns/...) live in a
+	 * single tnt_rules_t, so one struct copy applies them wholesale; each
+	 * handle refreshes under its own lock, therefore an in-flight SQL call
+	 * (which holds that lock for its whole batch) is never torn by the swap.
+	 * New connections get the fresh rules at handle_new anyway. */
+	for (hi = 0; hi < glob->nhandles; hi++) {
+		tnt_handle_t *hh = glob->handles[hi];
+
+		if (!hh)
+			continue;
+		if (hh->lock)
+			switch_mutex_lock(hh->lock);
+		hh->rules = glob->rules;
+		tnt_rules_set_uuid_default(&hh->rules, &hh->profile);
+		if (hh->lock)
+			switch_mutex_unlock(hh->lock);
+	}
 	switch_mutex_unlock(glob->mutex);
 	free(ng);
 
+	/* wake the <maintenance> thread so enable/interval/<sql> changes take
+	 * effect right away (the loop re-reads the snapshot on the next pass) */
+	maint_wakeup = 1;
+
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-					  "mod_tarantool: loaded %d profile(s), %d pk, %d pkadd, %d field rules\n",
-					  glob->nprofiles, glob->rules.npk, glob->rules.npkadd, glob->rules.nfields);
+					  "mod_tarantool: loaded %d profile(s), %d pk, %d pkadd, %d field rules, "
+					  "rules hot-applied to %d active connection(s)\n",
+					  glob->nprofiles, glob->rules.npk, glob->rules.npkadd, glob->rules.nfields,
+					  glob->nhandles);
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -953,6 +1018,20 @@ static void tnt_handle_unregister(tnt_handle_t *h)
 	switch_mutex_unlock(glob->mutex);
 }
 
+/* Pick the UUID default for the active host's version branch (3.x -> uuid7(),
+ * 2.10 -> uuid()). Called at handle_new and on every hot-reload rules swap. */
+static void tnt_rules_set_uuid_default(tnt_rules_t *r, const tnt_profile_cfg_t *p)
+{
+	const char *ver = p->hosts[0].version;
+
+	if (ver && !strncmp(ver, "3.", 2))
+		snprintf(r->uuid_default, sizeof(r->uuid_default), "%s",
+				 glob->uuid_default_32[0] ? glob->uuid_default_32 : "uuid7()");
+	else
+		snprintf(r->uuid_default, sizeof(r->uuid_default), "%s",
+				 glob->uuid_default_210[0] ? glob->uuid_default_210 : "uuid()");
+}
+
 static switch_status_t tnt_handle_new(switch_cache_db_database_interface_options_t opts,
 									  switch_database_interface_handle_t **dih)
 {
@@ -985,16 +1064,7 @@ static switch_status_t tnt_handle_new(switch_cache_db_database_interface_options
 	h->profile = *prof;
 	h->rules = glob->rules;
 	/* pick the UUID default per the active host's version branch */
-	{
-		const char *ver = h->profile.hosts[0].version;
-
-		if (ver && !strncmp(ver, "3.", 2))
-			snprintf(h->rules.uuid_default, sizeof(h->rules.uuid_default), "%s",
-					 glob->uuid_default_32);
-		else
-			snprintf(h->rules.uuid_default, sizeof(h->rules.uuid_default), "%s",
-					 glob->uuid_default_210);
-	}
+	tnt_rules_set_uuid_default(&h->rules, &h->profile);
 	/* propagate timeouts */
 	if (!h->profile.ping_idle_s)
 		h->profile.ping_idle_s = glob->ping_idle_ms / 1000;
@@ -1012,8 +1082,21 @@ static switch_status_t tnt_handle_new(switch_cache_db_database_interface_options
 	}
 	h->created_mono = switch_micro_time_now() / 1000;
 
+	/* per-handle lock: serializes SQL calls against the reload rules swap
+	 * (hot-reload refreshes h->rules under this lock). */
+	if (glob && glob->pool &&
+		switch_mutex_init(&h->lock, SWITCH_MUTEX_NESTED, glob->pool) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+						  "mod_tarantool: cannot init handle mutex for profile '%s'\n", pname);
+		tnt_session_close(&h->session);
+		free(h);
+		return SWITCH_STATUS_FALSE;
+	}
+
 	*dih = (switch_database_interface_handle_t *)calloc(1, sizeof(**dih));
 	if (!*dih) {
+		if (h->lock)
+			switch_mutex_destroy(h->lock);
 		tnt_session_close(&h->session);
 		free(h);
 		return SWITCH_STATUS_FALSE;
@@ -1035,6 +1118,8 @@ static switch_status_t tnt_handle_destroy(switch_database_interface_handle_t **d
 	if (h) {
 		tnt_handle_unregister(h);
 		tnt_session_close(&h->session);
+		if (h->lock)
+			switch_mutex_destroy(h->lock);
 		free(h);
 	}
 	free(*dih);
@@ -1245,6 +1330,10 @@ static switch_status_t tnt_exec_detailed(const char *file, const char *func, int
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
 
+	/* serialize SQL calls vs the reload rules swap (hot-reload) */
+	if (h->lock)
+		switch_mutex_lock(h->lock);
+
 	/* remember the first callsite that uses this connection */
 	if (!h->caller_set) {
 		snprintf(h->caller_file, sizeof(h->caller_file), "%s", file ? file : "?");
@@ -1255,6 +1344,8 @@ static switch_status_t tnt_exec_detailed(const char *file, const char *func, int
 
 	st = tnt_exec_sql(h, sql, &res, err);
 	tnt_result_free(&res);
+	if (h->lock)
+		switch_mutex_unlock(h->lock);
 	return st;
 }
 
@@ -1269,6 +1360,10 @@ static switch_status_t tnt_exec_string(switch_database_interface_handle_t *dih,
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
 
+	/* serialize SQL calls vs the reload rules swap (hot-reload) */
+	if (h->lock)
+		switch_mutex_lock(h->lock);
+
 	/* exec_string has no file/func/line; label the caller explicitly */
 	if (!h->caller_set) {
 		snprintf(h->caller_file, sizeof(h->caller_file), "%s", "exec_string");
@@ -1282,6 +1377,8 @@ static switch_status_t tnt_exec_string(switch_database_interface_handle_t *dih,
 		snprintf(resbuf, len, "%s", res.rows[0][0] ? res.rows[0][0] : "");
 	}
 	tnt_result_free(&res);
+	if (h->lock)
+		switch_mutex_unlock(h->lock);
 	return st;
 }
 
@@ -1348,6 +1445,10 @@ static switch_status_t tnt_callback_exec_detailed(const char *file, const char *
 	h = (tnt_handle_t *)dih->handle;
 	switch_assert(callback != NULL);
 
+	/* serialize SQL calls vs the reload rules swap (hot-reload) */
+	if (h->lock)
+		switch_mutex_lock(h->lock);
+
 	/* remember the first callsite that uses this connection */
 	if (!h->caller_set) {
 		snprintf(h->caller_file, sizeof(h->caller_file), "%s", file ? file : "?");
@@ -1364,6 +1465,8 @@ static switch_status_t tnt_callback_exec_detailed(const char *file, const char *
 	n = tnt_sql_split(sql, stmts, TNT_SQL_MAX_STMTS);
 	st = tnt_exec_statements(h, stmts, n, callback, pdata, &res, err);
 	tnt_result_free(&res);
+	if (h->lock)
+		switch_mutex_unlock(h->lock);
 	return st;
 }
 
@@ -1392,6 +1495,31 @@ static void api_print_profile(switch_stream_handle_t *stream, const tnt_profile_
 							   h->port, h->version[0] ? h->version : "?");
 	}
 	(void)detail;
+}
+
+/* Format a duration (seconds) as days:hours:minutes:seconds with units
+	* appearing progressively: "1d 02:03:04", "02:03:04", "03:04", "4s". */
+static void tnt_fmt_age(int64_t sec, char *buf, size_t cap)
+{
+	int64_t d, h, m, s;
+
+	if (sec < 0)
+		sec = 0;
+	d = sec / 86400;
+	sec %= 86400;
+	h = sec / 3600;
+	sec %= 3600;
+	m = sec / 60;
+	s = sec % 60;
+
+	if (d > 0)
+		snprintf(buf, cap, "%" PRId64 "d %02" PRId64 ":%02" PRId64 ":%02" PRId64, d, h, m, s);
+	else if (h > 0)
+		snprintf(buf, cap, "%02" PRId64 ":%02" PRId64 ":%02" PRId64, h, m, s);
+	else if (m > 0)
+		snprintf(buf, cap, "%02" PRId64 ":%02" PRId64, m, s);
+	else
+		snprintf(buf, cap, "%" PRId64 "s", s);
 }
 
 /* Join argv[start..argc-1] into a single malloc'ed SQL string, separating
@@ -1555,15 +1683,21 @@ SWITCH_STANDARD_API(api_tarantool)
 								   ch->use_unix ? "" : ":", ch->port,
 								   ch->version[0] ? ch->version : "?",
 								   h->session.cur, h->n_queries);
-			stream->write_function(stream,
-								   "    caller=%s:%d %s idle=%" PRId64 "ms auto_commit=%s last_affected=%d age=%" PRId64 "s\n",
-								   h->caller_file[0] ? h->caller_file : "?",
-								   h->caller_line,
-								   h->caller_func[0] ? h->caller_func : "?",
-								   idle_ms,
-								   h->auto_commit ? "true" : "false",
-								   h->affected_rows,
-								   h->created_mono ? (now_ms - h->created_mono) / 1000 : 0);
+			{
+				char agebuf[32];
+				int64_t age_s = h->created_mono ? (now_ms - h->created_mono) / 1000 : 0;
+
+				tnt_fmt_age(age_s, agebuf, sizeof(agebuf));
+				stream->write_function(stream,
+									   "    caller=%s:%d %s idle=%" PRId64 "ms auto_commit=%s last_affected=%d age=%s\n",
+									   h->caller_file[0] ? h->caller_file : "?",
+									   h->caller_line,
+									   h->caller_func[0] ? h->caller_func : "?",
+									   idle_ms,
+									   h->auto_commit ? "true" : "false",
+									   h->affected_rows,
+									   agebuf);
+			}
 			if (h->session.conn.fd >= 0)
 				up++;
 			shown++;
@@ -1937,13 +2071,19 @@ static void *SWITCH_THREAD_FUNC tnt_maint_run(switch_thread_t *thread, void *obj
 		if (interval > 0)
 			tnt_maint_iteration();
 
-		/* sleep in small steps so shutdown can interrupt quickly */
+		/* sleep in small steps so shutdown can interrupt quickly; a reload
+		 * (maint_wakeup) aborts the rest of the sleep and re-reads the
+		 * config immediately (enable/interval/<sql> hot-applied) */
 		{
 			int ms = interval > 0 ? interval * 1000 : 2000;
 
 			while (ms > 0 && maint_thread_running) {
 				switch_sleep(250000);	/* microseconds */
 				ms -= 250;
+				if (maint_wakeup) {
+					maint_wakeup = 0;
+					ms = 0;
+				}
 			}
 		}
 	}
@@ -1965,6 +2105,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_tarantool_load)
 		return SWITCH_STATUS_TERM;
 	memset(glob, 0, sizeof(*glob));
 
+	glob->pool = pool;
 	if (switch_mutex_init(&glob->mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "mod_tarantool: cannot init mutex\n");
 		free(glob);

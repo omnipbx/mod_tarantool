@@ -107,6 +107,103 @@ static char *fix_bigint(const char *src, size_t len)
 	return out;
 }
 
+/* ---------- <intColumns>: quoted numeric literals ---------- */
+
+/* Recognized numeric type names for <intColumns type="..."> and their
+	* CAST(... AS ...) targets (Tarantool SQL). */
+static const tnt_intcol_type_t intcol_types[] = {
+	{ "INTEGER",   "INTEGER" },
+	{ "INT",       "INTEGER" },
+	{ "BIGINT",    "INTEGER" },
+	{ "SMALLINT",  "INTEGER" },
+	{ "TINYINT",   "INTEGER" },
+	{ "MEDIUMINT", "INTEGER" },
+	{ "NUMBER",    "NUMBER" },
+	{ "DOUBLE",    "DOUBLE" },
+	{ "REAL",      "DOUBLE" },
+	{ "FLOAT",     "DOUBLE" },
+	{ "DECIMAL",   "DECIMAL" },
+	{ "NUMERIC",   "DECIMAL" },
+};
+
+SWITCH_DECLARE(const char *) tnt_intcol_cast_for_type(const char *type)
+{
+	size_t k;
+
+	if (!type || !type[0])
+		return NULL;
+	for (k = 0; k < sizeof(intcol_types) / sizeof(intcol_types[0]); k++) {
+		if (!strcasecmp(intcol_types[k].name, type))
+			return intcol_types[k].cast;
+	}
+	return NULL;
+}
+
+SWITCH_DECLARE(int) tnt_rules_add_intcol(tnt_rules_t *r, const char *table,
+										 const char *field, const char *type)
+{
+	const char *cast = tnt_intcol_cast_for_type(type);
+	int i;
+
+	if (!r || !table || !table[0] || !field || !field[0] || !cast)
+		return -1;
+	if (r->nintcols >= TNT_INTCOL_MAX)
+		return -1;
+	for (i = 0; i < r->nintcols; i++) {
+		if (!strcasecmp(r->intcols[i].table, table) &&
+			!strcasecmp(r->intcols[i].field, field))
+			return 0;			/* duplicate: keep the first entry */
+	}
+	snprintf(r->intcols[r->nintcols].table,
+			 sizeof(r->intcols[r->nintcols].table), "%s", table);
+	snprintf(r->intcols[r->nintcols].field,
+			 sizeof(r->intcols[r->nintcols].field), "%s", field);
+	snprintf(r->intcols[r->nintcols].type,
+			 sizeof(r->intcols[r->nintcols].type), "%s", cast);
+	r->nintcols++;
+	return 0;
+}
+
+static const tnt_intcol_rule_t *find_intcol(const tnt_rules_t *r,
+											const char *table, const char *field)
+{
+	int i;
+
+	for (i = 0; i < r->nintcols; i++) {
+		if (!strcasecmp(r->intcols[i].table, table) &&
+			!strcasecmp(r->intcols[i].field, field))
+			return &r->intcols[i];
+	}
+	return NULL;
+}
+
+/* span [a,b) is a plain single-quoted literal '...' ('' allowed) */
+static int is_sq_literal(const char *s, size_t a, size_t b)
+{
+	return b - a >= 2 && s[a] == '\'' && s[b - 1] == '\'';
+}
+
+static int is_empty_sq_literal(const char *s, size_t a, size_t b)
+{
+	return b - a == 2 && s[a] == '\'' && s[a + 1] == '\'';
+}
+
+/* append CAST('...' AS <cast>) — or NULL for an empty literal */
+static void emit_cast_val(char *out, size_t cap, size_t *o,
+						  const char *sql, size_t a, size_t b,
+						  const char *cast)
+{
+	if (is_empty_sq_literal(sql, a, b)) {
+		buf_puts(out, cap, o, "NULL");
+		return;
+	}
+	buf_puts(out, cap, o, "CAST(");
+	buf_putn(out, cap, o, sql + a, b - a);
+	buf_puts(out, cap, o, " AS ");
+	buf_puts(out, cap, o, cast);
+	buf_putc(out, cap, o, ')');
+}
+
 /* ---------- rule lookup ---------- */
 
 static const tnt_pk_rule_t *find_pk(const tnt_rules_t *r, const char *table)
@@ -912,6 +1009,249 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 	return out;
 }
 
+/* Extract the table name of an INSERT/UPDATE statement into tbl[64]. */
+static int dml_table_name(const char *sql, size_t len, const char *kw,
+						  size_t kwlen, char *tbl, size_t tblsz)
+{
+	size_t w = find_word(sql, len, kw);
+	size_t ts, te;
+
+	if (w == SIZE_MAX)
+		return -1;
+	w += kwlen;
+	while (w < len && isspace((unsigned char)sql[w]))
+		w++;
+	ts = w;
+	while (w < len && (isalnum((unsigned char)sql[w]) || sql[w] == '_'))
+		w++;
+	te = w;
+	if (ts == te || te - ts >= tblsz)
+		return -1;
+	memcpy(tbl, sql + ts, te - ts);
+	tbl[te - ts] = '\0';
+	return 0;
+}
+
+/* Rewrite INSERT ... VALUES (...): every value that is a plain string
+	* literal for a column declared in <intColumns> becomes
+	* CAST('...' AS <type>); an empty literal '' becomes NULL. Returns a
+	* malloc'ed rewritten statement or NULL when nothing matched (caller keeps
+	* the original). */
+static char *cast_insert_values(const tnt_rules_t *r, const char *sql)
+{
+	size_t len = strlen(sql);
+	size_t cl, cr, vl, vr, i;
+	char tbl[64] = "";
+	seg_t *cols = NULL, *vals = NULL;
+	int ncols = 0, nvals = 0, j, need = 0;
+	char *out = NULL;
+	size_t cap, o = 0;
+
+	if (r->nintcols == 0)
+		return NULL;
+
+	/* column list opening paren */
+	cl = SIZE_MAX;
+	for (i = 0; i < len; i++) {
+		if (sql[i] == '(') {
+			cl = i;
+			break;
+		}
+	}
+	if (cl == SIZE_MAX)
+		return NULL;
+	cr = r_match_paren(sql, len, cl);
+	if (cr == SIZE_MAX)
+		return NULL;
+	/* VALUES keyword + first tuple */
+	vl = find_word(sql + cr + 1, len - cr - 1, "values");
+	if (vl == SIZE_MAX)
+		return NULL;
+	vl += cr + 1 + 6;
+	while (vl < len && isspace((unsigned char)sql[vl]))
+		vl++;
+	if (vl >= len || sql[vl] != '(')
+		return NULL;
+	vr = r_match_paren(sql, len, vl);
+	if (vr == SIZE_MAX)
+		return NULL;
+
+	if (dml_table_name(sql, len, "into", 4, tbl, sizeof(tbl)) != 0)
+		return NULL;
+
+	cols = split_defs(sql, cl + 1, cr, &ncols);
+	vals = split_defs(sql, vl + 1, vr, &nvals);
+	if (!cols || !vals)
+		goto done;
+	if (ncols != nvals)
+		goto done;
+
+	for (j = 0; j < ncols; j++) {
+		char nm[64];
+
+		def_first_ident(sql, cols[j].start, cols[j].end, nm, sizeof(nm));
+		if (nm[0] && find_intcol(r, tbl, nm) &&
+			is_sq_literal(sql, vals[j].start, vals[j].end)) {
+			need = 1;
+			break;
+		}
+	}
+	if (!need)
+		goto done;
+
+	cap = len + 128;
+	out = (char *)malloc(cap);
+	if (!out)
+		goto done;
+	o = 0;
+	buf_putn(out, cap, &o, sql, vl + 1);	/* through "VALUES (" */
+	for (j = 0; j < ncols; j++) {
+		char nm[64];
+		const tnt_intcol_rule_t *ic;
+
+		if (j)
+			buf_putc(out, cap, &o, ',');
+		buf_putc(out, cap, &o, ' ');
+		def_first_ident(sql, cols[j].start, cols[j].end, nm, sizeof(nm));
+		ic = nm[0] ? find_intcol(r, tbl, nm) : NULL;
+		if (ic && is_sq_literal(sql, vals[j].start, vals[j].end))
+			emit_cast_val(out, cap, &o, sql, vals[j].start, vals[j].end, ic->type);
+		else
+			buf_putn(out, cap, &o, sql + vals[j].start,
+					 vals[j].end - vals[j].start);
+	}
+	buf_putc(out, cap, &o, ')');
+	buf_putn(out, cap, &o, sql + vr + 1, len - (vr + 1));	/* trailing */
+	buf_putc(out, cap, &o, '\0');
+
+done:
+	free(cols);
+	free(vals);
+	return out;
+}
+
+/* Locate the top-level '=' inside an assignment segment; SIZE_MAX if none.
+	* Skips string literals and parenthesized expressions. */
+static size_t assign_eq(const char *sql, size_t a, size_t b)
+{
+	size_t k;
+	int depth = 0;
+
+	for (k = a; k < b; k++) {
+		char c = sql[k];
+
+		if (c == '\'') {
+			k++;
+			while (k < b && sql[k] != '\'') {
+				if (sql[k] == '\'' && k + 1 < b && sql[k + 1] == '\'')
+					k++;
+				k++;
+			}
+			continue;
+		}
+		if (c == '(')
+			depth++;
+		else if (c == ')') {
+			if (depth > 0)
+				depth--;
+		} else if (c == '=' && depth == 0)
+			return k;
+	}
+	return SIZE_MAX;
+}
+
+/* Rewrite UPDATE ... SET col='...' for <intColumns> columns: quoted numeric
+	* literals become CAST('...' AS <type>), '' -> NULL. Returns a malloc'ed
+	* rewritten statement or NULL when nothing matched. */
+static char *cast_update_set(const tnt_rules_t *r, const char *sql)
+{
+	size_t len = strlen(sql);
+	size_t setp;
+	char tbl[64] = "";
+	seg_t *segs = NULL;
+	int nseg, j, need = 0;
+	char *out = NULL;
+	size_t cap, o = 0;
+
+	if (r->nintcols == 0)
+		return NULL;
+	if (dml_table_name(sql, len, "update", 6, tbl, sizeof(tbl)) != 0)
+		return NULL;
+
+	setp = find_word(sql, len, "set");
+	if (setp == SIZE_MAX)
+		return NULL;
+	setp += 3;
+	while (setp < len && isspace((unsigned char)sql[setp]))
+		setp++;
+
+	segs = split_defs(sql, setp, len, &nseg);
+	if (!segs)
+		return NULL;
+
+	for (j = 0; j < nseg; j++) {
+		size_t eq = assign_eq(sql, segs[j].start, segs[j].end);
+		size_t va, vb;
+		char nm[64];
+
+		if (eq == SIZE_MAX)
+			continue;
+		def_first_ident(sql, segs[j].start, eq, nm, sizeof(nm));
+		va = eq + 1;
+		vb = segs[j].end;
+		while (va < vb && isspace((unsigned char)sql[va]))
+			va++;
+		while (vb > va && isspace((unsigned char)sql[vb - 1]))
+			vb--;
+		if (nm[0] && find_intcol(r, tbl, nm) && is_sq_literal(sql, va, vb)) {
+			need = 1;
+			break;
+		}
+	}
+	if (!need)
+		goto done;
+
+	cap = len + 128;
+	out = (char *)malloc(cap);
+	if (!out)
+		goto done;
+	o = 0;
+	buf_putn(out, cap, &o, sql, setp);	/* through "set " */
+	for (j = 0; j < nseg; j++) {
+		size_t eq = assign_eq(sql, segs[j].start, segs[j].end);
+		size_t va, vb;
+		char nm[64];
+		const tnt_intcol_rule_t *ic;
+
+		if (j)
+			buf_putc(out, cap, &o, ',');
+		buf_putc(out, cap, &o, ' ');
+		if (eq == SIZE_MAX) {
+			buf_putn(out, cap, &o, sql + segs[j].start,
+					 segs[j].end - segs[j].start);
+			continue;
+		}
+		def_first_ident(sql, segs[j].start, eq, nm, sizeof(nm));
+		va = eq + 1;
+		vb = segs[j].end;
+		while (va < vb && isspace((unsigned char)sql[va]))
+			va++;
+		while (vb > va && isspace((unsigned char)sql[vb - 1]))
+			vb--;
+		ic = nm[0] ? find_intcol(r, tbl, nm) : NULL;
+		buf_putn(out, cap, &o, sql + segs[j].start, (eq + 1) - segs[j].start);
+		if (ic && is_sq_literal(sql, va, vb))
+			emit_cast_val(out, cap, &o, sql, va, vb, ic->type);
+		else
+			buf_putn(out, cap, &o, sql + va, vb - va);
+	}
+	buf_putc(out, cap, &o, '\0');
+
+done:
+	free(segs);
+	return out;
+}
+
 /* SELECT with "FROM <view>": rewrite into "FROM (<body>) AS <view>" so the
  * statement survives on Tarantool, which has no VIEW. Only the FIRST "FROM"
  * clause is inspected; a view referenced elsewhere (JOIN, nested SELECT) is
@@ -978,10 +1318,46 @@ SWITCH_DECLARE(char *) tnt_rules_translate(const tnt_rules_t *r, const tnt_stmt_
 		{
 			char *inj = inject_insert_columns(r, st, ctx);
 
-			if (inj)
+			if (inj) {
+				char *c = cast_insert_values(r, inj);
+
+				if (c) {
+					free(inj);
+					return c;
+				}
 				return inj;
+			}
+			/* no PK/addField injection: try the quoted-numeric rewrite */
+			{
+				size_t l = st->end - st->start;
+				char *base = (char *)malloc(l + 1);
+				char *c;
+
+				if (base) {
+					memcpy(base, st->sql + st->start, l);
+					base[l] = '\0';
+					c = cast_insert_values(r, base);
+					free(base);
+					if (c)
+						return c;
+				}
+			}
 		}
-		/* FALLTHROUGH: no injection needed, pass through */
+		/* FALLTHROUGH: no rewrite matched, pass through */
+	case TNT_STMT_UPDATE:
+		{
+			char *fixed = fix_bigint(st->sql + st->start, st->end - st->start);
+			char *c;
+
+			if (!fixed)
+				return NULL;
+			c = cast_update_set(r, fixed);
+			if (c) {
+				free(fixed);
+				return c;
+			}
+			return fixed;
+		}
 	case TNT_STMT_SELECT:
 		{
 			char *exp = expand_view_select(r, st);

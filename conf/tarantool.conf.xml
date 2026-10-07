@@ -186,6 +186,26 @@
     -->
   </addField>
 
+  <!-- Numeric columns whose values may arrive from FreeSWITCH as QUOTED
+       string literals ('1791322069') although the column is numeric:
+       channels.created_epoch and calls.call_created_epoch are formatted by
+       the core as '%ld' INSIDE single quotes (switch_core_sqldb.c). Tarantool
+       does not coerce string->number on INSERT/UPDATE, so such values are
+       rewritten to CAST('...' AS <type>); an empty string '' becomes NULL.
+       Only the listed fields are ever touched; bare numbers, NULL, functions
+       and expressions pass through unchanged. Recognized types:
+         INTEGER/INT/BIGINT/SMALLINT/TINYINT/MEDIUMINT -> INTEGER
+         NUMBER                                    -> NUMBER
+         DOUBLE/REAL/FLOAT                          -> DOUBLE
+         DECIMAL/NUMERIC                            -> DECIMAL
+       An unknown type is rejected with a warning at load/reload and the
+       entry is ignored. Limit: 64 entries. -->
+  <intColumns>
+    <param table="channels" field="created_epoch" type="INTEGER"/>
+    <param table="calls" field="call_created_epoch" type="INTEGER"/>
+    <param table="sip_authentication" field="expires" type="INTEGER"/>
+  </intColumns>
+
   <!-- Tarantool has NO VIEW. The FreeSWITCH core and mod_commands issue
        "select * from basic_calls / detailed_calls" (show calls etc.), which
        fails with "Space 'basic_calls' does not exist". A <views> entry tells
