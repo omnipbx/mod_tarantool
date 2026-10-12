@@ -1,32 +1,32 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* tnt_client.c -- minimal IPROTO binary-protocol client
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * tnt_client.c -- minimal IPROTO binary-protocol client
+ *
+ */
 
 #include "tnt_client.h"
 #include "mp_decode.h"
@@ -61,15 +61,19 @@
 #define IPROTO_DATA		0x30
 #define IPROTO_ERROR_24		0x31
 #define IPROTO_METADATA		0x32	/* >= 3.x */
+#define IPROTO_BIND_METADATA	0x33	/* PREPARE response: parameter list */
+#define IPROTO_BIND_COUNT	0x34	/* PREPARE response: parameter count */
 #define IPROTO_SQL_TEXT		0x40
 #define IPROTO_SQL_BIND		0x41
 #define IPROTO_SQL_INFO		0x42
+#define IPROTO_STMT_ID		0x43
 #define IPROTO_METADATA_OLD	0x52	/* < 3.x; 3.x uses 0x52 for ERROR map */
 #define IPROTO_ERROR_STACK	0x71
 
 #define IPROTO_OK		0x00
 #define IPROTO_AUTH		0x07
 #define IPROTO_EXECUTE		0x0b
+#define IPROTO_PREPARE		0x0d
 #define IPROTO_PING		0x40
 
 #define IPROTO_SQL_INFO_ROW_COUNT	0x00
@@ -86,6 +90,7 @@ static int parse_response(tnt_conn_t *c, tnt_result_t *res);
 static int build_request(tnt_conn_t *c, uint8_t type, tnt_mp_writer_t *w);
 static int conn_send_request(tnt_conn_t *c, uint8_t type, const uint8_t *body, size_t body_len);
 static int conn_recv_frame(tnt_conn_t *c, uint8_t **body, size_t *body_len);
+void tnt_conn_prep_reset(tnt_conn_t *c);
 
 /* ---------- time helpers ---------- */
 
@@ -95,6 +100,105 @@ static int64_t mono_ms(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ---------- shared circuit breaker registry (per-host, keyed by addr:port) ---------- */
+
+static circuit_breaker_t g_cbs[TNT_CB_MAX];
+static char g_cb_keys[TNT_CB_MAX][TNT_ADDR_MAX + 8];
+static int g_ncbs;
+static pthread_mutex_t g_cb_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_cb_mode = CB_MODE_OFF;
+static int g_cb_threshold = CB_FAIL_THRESHOLD_DEFAULT;
+static int64_t g_cb_timeout_ms = CB_TIMEOUT_MS_DEFAULT;
+
+SWITCH_DECLARE(circuit_breaker_t *) tnt_cb_get(const char *addr, uint16_t port,
+											   int use_unix)
+{
+	char key[TNT_ADDR_MAX + 8];
+	circuit_breaker_t *cb = NULL;
+	int i;
+
+	if (use_unix)
+		snprintf(key, sizeof(key), "%s", addr);
+	else
+		snprintf(key, sizeof(key), "%s:%u", addr, (unsigned)port);
+
+	pthread_mutex_lock(&g_cb_lock);
+	for (i = 0; i < g_ncbs; i++) {
+		if (!strcmp(g_cb_keys[i], key)) {
+			cb = &g_cbs[i];
+			break;
+		}
+	}
+	if (!cb && g_ncbs < TNT_CB_MAX) {
+		cb = &g_cbs[g_ncbs];
+		cb_init(cb, (cb_mode_t)g_cb_mode, g_cb_threshold, g_cb_timeout_ms);
+		snprintf(g_cb_keys[g_ncbs], sizeof(g_cb_keys[0]), "%s", key);
+		g_ncbs++;
+	}
+	pthread_mutex_unlock(&g_cb_lock);
+	return cb;
+}
+
+SWITCH_DECLARE(int) tnt_cb_enabled(void)
+{
+	return __atomic_load_n(&g_cb_mode, __ATOMIC_ACQUIRE) != CB_MODE_OFF;
+}
+
+SWITCH_DECLARE(void) tnt_cb_configure(cb_mode_t mode, int threshold,
+									  int64_t timeout_ms)
+{
+	int i;
+
+	pthread_mutex_lock(&g_cb_lock);
+	g_cb_mode = (int)mode;
+	g_cb_threshold = threshold > 0 ? threshold : CB_FAIL_THRESHOLD_DEFAULT;
+	g_cb_timeout_ms = timeout_ms > 0 ? timeout_ms : CB_TIMEOUT_MS_DEFAULT;
+	for (i = 0; i < g_ncbs; i++)
+		cb_configure(&g_cbs[i], (cb_mode_t)g_cb_mode, g_cb_threshold,
+					 g_cb_timeout_ms);
+	pthread_mutex_unlock(&g_cb_lock);
+}
+
+SWITCH_DECLARE(void) tnt_cb_reset_all(void)
+{
+	int i;
+
+	pthread_mutex_lock(&g_cb_lock);
+	for (i = 0; i < g_ncbs; i++)
+		cb_reset(&g_cbs[i]);
+	pthread_mutex_unlock(&g_cb_lock);
+}
+
+SWITCH_DECLARE(int) tnt_cb_show(char *buf, size_t buflen)
+{
+	size_t off = 0;
+	int i;
+
+	pthread_mutex_lock(&g_cb_lock);
+	off += (size_t)snprintf(buf + off, buflen - off,
+							"circuit breaker: mode=%s threshold=%d timeout=%lldms hosts=%d\n",
+							cb_mode_name(g_cb_mode), g_cb_threshold,
+							(long long)g_cb_timeout_ms, g_ncbs);
+	for (i = 0; i < g_ncbs && off < buflen; i++) {
+		circuit_breaker_t *cb = &g_cbs[i];
+
+		off += (size_t)snprintf(buf + off, buflen - off,
+								"  %-24s state=%-9s fails=%d open_until=%lld probing=%d "
+								"opens=%llu fail_fast=%llu probes=%llu successes=%llu\n",
+								g_cb_keys[i],
+								cb_state_name(__atomic_load_n(&cb->state, __ATOMIC_ACQUIRE)),
+								__atomic_load_n(&cb->failure_count, __ATOMIC_ACQUIRE),
+								(long long)__atomic_load_n(&cb->open_until, __ATOMIC_ACQUIRE),
+								__atomic_load_n(&cb->is_probing, __ATOMIC_ACQUIRE),
+								(unsigned long long)__atomic_load_n(&cb->metrics_opens, __ATOMIC_RELAXED),
+								(unsigned long long)__atomic_load_n(&cb->metrics_fail_fast, __ATOMIC_RELAXED),
+								(unsigned long long)__atomic_load_n(&cb->metrics_probes, __ATOMIC_RELAXED),
+								(unsigned long long)__atomic_load_n(&cb->metrics_successes, __ATOMIC_RELAXED));
+	}
+	pthread_mutex_unlock(&g_cb_lock);
+	return (int)off;
 }
 
 static char *dup_str(const char *s, size_t n)
@@ -370,6 +474,12 @@ SWITCH_DECLARE(void) tnt_conn_init(tnt_conn_t *c, const tnt_host_cfg_t *h,
 	snprintf(c->pass, sizeof(c->pass), "%s", pass ? pass : "");
 	c->rw_timeout_ms = rw_timeout_ms;
 	c->sync = 1;
+	/* host-level prepare flag (already resolved against the profile
+	 * default at parse time) */
+	c->prepare_allowed = h->prepare > 0;
+	c->server_major = 0;
+	c->server_minor = 0;
+	c->prepare_supported = 1;	/* optimistic: confirmed by the greeting */
 }
 
 SWITCH_DECLARE(int) tnt_conn_is_open(const tnt_conn_t *c)
@@ -380,6 +490,31 @@ SWITCH_DECLARE(int) tnt_conn_is_open(const tnt_conn_t *c)
 SWITCH_DECLARE(const char *) tnt_conn_last_error(const tnt_conn_t *c)
 {
 	return c->error[0] ? c->error : "unknown error";
+}
+
+SWITCH_DECLARE(int) tnt_parse_server_version(const char *line,
+											 int *major, int *minor)
+{
+	char *end = NULL;
+	long m, n;
+
+	if (!line)
+		return 0;
+	m = strtol(line, &end, 10);
+	if (end == line || m <= 0 || m > 100)
+		return 0;
+	if (*end == '.') {
+		n = strtol(end + 1, &end, 10);
+		if (n < 0 || n > 100)
+			n = 0;
+	} else {
+		n = 0;
+	}
+	if (major)
+		*major = (int)m;
+	if (minor)
+		*minor = (int)n;
+	return 1;
 }
 
 static void conn_seterr(tnt_conn_t *c, const char *fmt, ...)
@@ -397,6 +532,7 @@ SWITCH_DECLARE(void) tnt_conn_close(tnt_conn_t *c)
 		close(c->fd);
 		c->fd = -1;
 	}
+	tnt_conn_prep_reset(c);		/* stmt_ids die with the connection */
 }
 
 /* Non-blocking connect with timeout via poll(). */
@@ -548,6 +684,19 @@ static int conn_read_greeting(tnt_conn_t *c)
 	if (memcmp(buf, "Tarantool ", 10) != 0) {
 		conn_seterr(c, "not a Tarantool server (greeting mismatch)");
 		return -1;
+	}
+
+	/* REAL server version from the greeting line ("Tarantool X.Y.Z ...").
+	 * box.prepare (and IPROTO_PREPARE) appeared in 2.11: gate the
+	 * prepared-statement path on the actual server, not on the profile's
+	 * compatibility dial. Unparseable greetings keep the optimistic
+	 * default (prepare_supported = 1); a refusal then falls back. */
+	if (tnt_parse_server_version(buf + 10, &c->server_major, &c->server_minor)) {
+		c->prepare_supported =
+			(c->server_major > 2 || (c->server_major == 2 && c->server_minor >= 11));
+	} else {
+		c->server_major = 0;
+		c->server_minor = 0;
 	}
 
 	/* find the first '\n' (end of the version line) */
@@ -1039,11 +1188,18 @@ typedef struct raw_row {
 SWITCH_DECLARE(int) tnt_result_init(tnt_result_t *res, int ncols, int nrows)
 {
 	int r, c;
+	/* preserve prepare-response fields: tnt_result_init is called from
+	 * fill_result() at the END of parse_response, AFTER the body loop
+	 * has already recorded stmt_id for a PREPARE response */
+	uint32_t sid = res->stmt_id;
+	int has_sid = res->has_stmt_id;
 
 	memset(res, 0, sizeof(*res));
 	res->ncols = ncols;
 	res->nrows = nrows;
 	res->affected_rows = -1;
+	res->stmt_id = sid;
+	res->has_stmt_id = has_sid;
 
 	if (ncols < 0 || nrows < 0)
 		return -1;
@@ -1168,6 +1324,15 @@ static int parse_response(tnt_conn_t *c, tnt_result_t *res)
 					have_sync = 1;
 				}
 				break;
+			case IPROTO_STMT_ID:
+				/* PREPARE response: Tarantool 3.x carries stmt_id in the
+				 * HEADER map (alongside type/sync/schema_version); some
+				 * generations put it in the body - both are handled. */
+				if (v.type == TNT_MP_UINT) {
+					res->stmt_id = (uint32_t)v.u;
+					res->has_stmt_id = 1;
+				}
+				break;
 			default:
 				if (tnt_mp_skip_contents(&rd, &v) < 0) {
 					ret = -1;
@@ -1283,6 +1448,12 @@ static int parse_response(tnt_conn_t *c, tnt_result_t *res)
 							}
 						}
 						ncols = (int)nm;
+					}
+					break;
+				case IPROTO_STMT_ID:
+					if (v.type == TNT_MP_UINT) {
+						res->stmt_id = (uint32_t)v.u;
+						res->has_stmt_id = 1;
 					}
 					break;
 				case IPROTO_SQL_INFO:
@@ -1442,6 +1613,227 @@ SWITCH_DECLARE(int) tnt_conn_ping(tnt_conn_t *c)
 	memset(&res, 0, sizeof(res));
 	rc = parse_response(c, &res);
 	return rc < 0 ? -1 : 0;
+}
+
+/* ---------- prepared statements ---------- */
+
+SWITCH_DECLARE(void) tnt_conn_prep_reset(tnt_conn_t *c)
+{
+	c->nprep = 0;
+}
+
+SWITCH_DECLARE(int) tnt_conn_prep_lookup(const tnt_conn_t *c, uint64_t hash,
+										 uint32_t *stmt_id)
+{
+	int i;
+
+	for (i = 0; i < c->nprep; i++) {
+		if (c->prep[i].hash == hash) {
+			if (stmt_id)
+				*stmt_id = c->prep[i].stmt_id;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+SWITCH_DECLARE(void) tnt_conn_prep_insert(tnt_conn_t *c, uint64_t hash,
+										  uint32_t stmt_id)
+{
+	int i;
+
+	for (i = 0; i < c->nprep; i++) {
+		if (c->prep[i].hash == hash) {
+			c->prep[i].stmt_id = stmt_id;
+			return;
+		}
+	}
+	if (c->nprep >= TNT_PREP_MAX) {
+		/* FIFO eviction: drop the oldest entry, shift the rest */
+		memmove(&c->prep[0], &c->prep[1],
+				sizeof(c->prep[0]) * (size_t)(TNT_PREP_MAX - 1));
+		c->nprep = TNT_PREP_MAX - 1;
+	}
+	c->prep[c->nprep].hash = hash;
+	c->prep[c->nprep].stmt_id = stmt_id;
+	c->nprep++;
+}
+
+SWITCH_DECLARE(void) tnt_conn_prep_drop(tnt_conn_t *c, uint64_t hash)
+{
+	int i, j;
+
+	for (i = 0; i < c->nprep; i++) {
+		if (c->prep[i].hash == hash) {
+			for (j = i + 1; j < c->nprep; j++)
+				c->prep[j - 1] = c->prep[j];
+			c->nprep--;
+			return;
+		}
+	}
+}
+
+SWITCH_DECLARE(int) tnt_conn_prepare(tnt_conn_t *c, const char *sql_q,
+									 uint32_t *stmt_id)
+{
+	uint8_t body[8192];
+	tnt_mp_writer_t w;
+	uint8_t *rbody;
+	size_t rlen;
+	tnt_result_t res;
+	int rc;
+
+	memset(&res, 0, sizeof(res));
+	tnt_mp_writer_init(&w, body, sizeof(body));
+	if (build_request(c, IPROTO_PREPARE, &w) < 0)
+		return -1;
+	/* prepare body: {IPROTO_SQL_TEXT: sql} */
+	if (tnt_mp_write_map_header(&w, 1) < 0)
+		return -1;
+	if (tnt_mp_write_uint(&w, IPROTO_SQL_TEXT) < 0)
+		return -1;
+	if (tnt_mp_write_str(&w, sql_q, strlen(sql_q)) < 0)
+		return -1;
+
+	if (conn_send_request(c, IPROTO_PREPARE, body, w.len) < 0)
+		return -1;
+	if (conn_recv_frame(c, &rbody, &rlen) < 0)
+		return -1;
+	c->last_used_mono = mono_ms();
+	rc = parse_response(c, &res);
+	if (rc < 0)
+		return -1;
+	if (rc > 0) {
+		/* a SQL error (DDL not preparable, syntax, old server, ...) */
+		if (res.error[0])
+			snprintf(c->error, sizeof(c->error), "%s", res.error);
+		return 1;
+	}
+	if (!res.has_stmt_id) {
+		/* diagnostic hex dump of the raw response: helps identify a
+		 * generation that carries stmt_id under a different key */
+		size_t dump = c->rsp_len < 64 ? c->rsp_len : 64;
+		size_t i;
+		char hex[3 * 64 + 1];
+
+		hex[0] = '\0';
+		for (i = 0; i < dump; i++)
+			snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", c->rsp[i]);
+		conn_seterr(c, "PREPARE response carries no stmt_id (rsp %zu bytes: %s)",
+					c->rsp_len, hex);
+		return 1;
+	}
+	*stmt_id = res.stmt_id;
+	return 0;
+}
+
+SWITCH_DECLARE(int) tnt_conn_exec_stmt(tnt_conn_t *c, uint32_t stmt_id,
+									   const uint8_t *bind, size_t bind_len,
+									   tnt_result_t *res)
+{
+	uint8_t *body;
+	size_t blen = 64 + bind_len;
+	tnt_mp_writer_t w;
+	uint8_t *rbody;
+	size_t rlen;
+	int rc;
+
+	body = (uint8_t *)malloc(blen);
+	if (!body)
+		return -1;
+	tnt_mp_writer_init(&w, body, blen);
+	if (build_request(c, IPROTO_EXECUTE, &w) < 0) {
+		free(body);
+		return -1;
+	}
+	/* execute body: {IPROTO_STMT_ID: id[, IPROTO_SQL_BIND: bind]} */
+	if (tnt_mp_write_map_header(&w, bind ? 2 : 1) < 0) {
+		free(body);
+		return -1;
+	}
+	if (tnt_mp_write_uint(&w, IPROTO_STMT_ID) < 0 ||
+		tnt_mp_write_uint(&w, stmt_id) < 0) {
+		free(body);
+		return -1;
+	}
+	if (bind && (tnt_mp_write_uint(&w, IPROTO_SQL_BIND) < 0 ||
+				 tnt_mp_write_bytes(&w, bind, bind_len) < 0)) {
+		free(body);
+		return -1;
+	}
+	rc = conn_send_request(c, IPROTO_EXECUTE, body, w.len);
+	free(body);
+	if (rc < 0)
+		return -1;
+	if (conn_recv_frame(c, &rbody, &rlen) < 0)
+		return -1;
+	c->last_used_mono = mono_ms();
+	rc = parse_response(c, res);
+	return rc;
+}
+
+SWITCH_DECLARE(int) tnt_bind_encode(const tnt_sql_val_t *vals, int nvals,
+									uint8_t *buf, size_t cap, size_t *blen)
+{
+	tnt_mp_writer_t w;
+	int i;
+
+	tnt_mp_writer_init(&w, buf, cap);
+	if (tnt_mp_write_array_header(&w, (uint32_t)nvals) < 0)
+		return -1;
+	for (i = 0; i < nvals; i++) {
+		if (vals[i].is_string) {
+			size_t slen = strlen(vals[i].text);
+
+			if (tnt_mp_write_str(&w, vals[i].text, slen) < 0)
+				return -1;
+			continue;
+		}
+		/* bare number: integer when it round-trips, double otherwise */
+		{
+			const char *s = vals[i].text;
+			char *end = NULL;
+			long long ll;
+
+			errno = 0;
+			ll = strtoll(s, &end, 10);
+			if (errno != ERANGE && end && *end == '\0' && end != s) {
+				if (tnt_mp_write_int(&w, (int64_t)ll) < 0)
+					return -1;
+				continue;
+			}
+			/* out of int64 range: positives may still fit uint64 */
+			if (errno == ERANGE && s[0] != '-') {
+				unsigned long long ull;
+
+				errno = 0;
+				ull = strtoull(s, &end, 10);
+				if (errno != ERANGE && end && *end == '\0' && end != s) {
+					if (tnt_mp_write_uint(&w, (uint64_t)ull) < 0)
+						return -1;
+					continue;
+				}
+			}
+			{
+				double d;
+
+				errno = 0;
+				d = strtod(s, &end);
+				if (errno != ERANGE && end && *end == '\0' && end != s) {
+					if (tnt_mp_write_double(&w, d) < 0)
+						return -1;
+					continue;
+				}
+			}
+			/* not parseable as a number: send as a string (keeps the
+			 * value verbatim; the server casts per the column type) */
+			if (tnt_mp_write_str(&w, s, strlen(s)) < 0)
+				return -1;
+		}
+	}
+	if (blen)
+		*blen = tnt_mp_writer_len(&w);
+	return 0;
 }
 
 SWITCH_DECLARE(int) tnt_conn_precheck(tnt_conn_t *c)
@@ -1616,10 +2008,40 @@ static int session_run_init(tnt_session_t *s)
 static int try_host(tnt_session_t *s, int idx, uint32_t ct_ms)
 {
 	const tnt_host_cfg_t *h = &s->cfg->hosts[idx];
+	circuit_breaker_t *cb = NULL;
 	int rc;
+	int is_probe = 0;
+
+	if (tnt_cb_enabled())
+		cb = tnt_cb_get(h->addr, h->port, h->use_unix);
+
+	if (cb) {
+		cb_action_t act = cb_check_and_register(cb);
+
+		if (act == CB_ACTION_BLOCK_FAST) {
+			conn_seterr(&s->conn, "circuit breaker OPEN (fail-fast) for %s", h->addr);
+			return -1;
+		}
+		if (act == CB_ACTION_BLOCK_WAIT) {
+			if (cb_wait_until_open(cb, s->cfg->query_timeout_ms) < 0) {
+				conn_seterr(&s->conn, "circuit breaker OPEN (wait timeout) for %s", h->addr);
+				return -1;
+			}
+			/* window expired or probe succeeded: re-check (may win the probe) */
+			act = cb_check_and_register(cb);
+			if (act == CB_ACTION_BLOCK_FAST || act == CB_ACTION_BLOCK_WAIT) {
+				conn_seterr(&s->conn, "circuit breaker OPEN for %s", h->addr);
+				return -1;
+			}
+		}
+		if (act == CB_ACTION_PROBE)
+			is_probe = 1;
+	}
 
 	tnt_conn_init(&s->conn, h, s->user, s->pass, s->cfg->query_timeout_ms);
 	rc = tnt_conn_connect(&s->conn, ct_ms);
+	if (is_probe)
+		cb_finalize_probe(cb, rc == 0);
 	if (rc == 0) {
 		s->cur = idx;
 		s->backoff_host[idx] = 0;
@@ -1630,8 +2052,10 @@ static int try_host(tnt_session_t *s, int idx, uint32_t ct_ms)
 		}
 		return 0;
 	}
-	/* mark dead with exponential backoff */
-	{
+	if (cb && !is_probe)
+		cb_report_failure(cb);	/* connect failure counts toward OPEN */
+	/* mark dead with exponential backoff (only when the breaker is OFF) */
+	if (!tnt_cb_enabled()) {
 		int64_t now = mono_ms();
 		uint32_t b = s->backoff_host[idx];
 
@@ -1654,6 +2078,7 @@ SWITCH_DECLARE(int) tnt_session_open(tnt_session_t *s)
 	int attempt;
 	int start;
 	uint32_t ct;
+	int blocked = 0;
 
 	if (!s->cfg || s->cfg->nhosts <= 0)
 		return -1;
@@ -1669,6 +2094,15 @@ SWITCH_DECLARE(int) tnt_session_open(tnt_session_t *s)
 	for (attempt = 0; attempt < s->cfg->nhosts; attempt++) {
 		int idx = (start + attempt) % s->cfg->nhosts;
 
+		if (tnt_cb_enabled()) {
+			const tnt_host_cfg_t *h = &s->cfg->hosts[idx];
+			circuit_breaker_t *cb = tnt_cb_get(h->addr, h->port, h->use_unix);
+
+			if (cb && cb_is_blocked(cb)) {
+				blocked++;
+				continue;		/* failover: skip a breaker-blocked host */
+			}
+		}
 		if (s->dead_until_host[idx] > now)
 			continue;			/* still in backoff */
 		if (try_host(s, idx, ct) == 0) {
@@ -1680,8 +2114,38 @@ SWITCH_DECLARE(int) tnt_session_open(tnt_session_t *s)
 		}
 	}
 
+	/* every host is blocked by the breaker (single-host case): wait on the
+	 * first one -- try_host performs the WAIT sleep and the probe */
+	if (tnt_cb_enabled() && blocked == s->cfg->nhosts) {
+		if (try_host(s, start, ct) == 0) {
+			if (s->broken) {
+				s->broken = 0;
+				tnt_event_emit("session-recovered", s->cfg->name, "reconnected");
+			}
+			return 0;
+		}
+	}
+
 	s->all_dead = 1;
 	return -1;
+}
+
+/* Report a transport success/failure of the CURRENT host to its breaker. */
+static void cb_report_cur(tnt_session_t *s, int success)
+{
+	const tnt_host_cfg_t *h;
+	circuit_breaker_t *cb;
+
+	if (!tnt_cb_enabled() || s->cur < 0 || s->cur >= s->cfg->nhosts)
+		return;
+	h = &s->cfg->hosts[s->cur];
+	cb = tnt_cb_get(h->addr, h->port, h->use_unix);
+	if (!cb)
+		return;
+	if (success)
+		cb_report_success(cb);
+	else
+		cb_report_failure(cb);
 }
 
 SWITCH_DECLARE(int) tnt_session_execute(tnt_session_t *s, const char *sql,
@@ -1698,6 +2162,7 @@ SWITCH_DECLARE(int) tnt_session_execute(tnt_session_t *s, const char *sql,
 
 		if (idle >= (int64_t)s->cfg->ping_idle_s * 1000 || idle < 0) {
 			if (tnt_conn_ping(&s->conn) < 0) {
+				cb_report_cur(s, 0);
 				tnt_session_mark_broken(s);
 				tnt_conn_close(&s->conn);
 				if (!retryable)
@@ -1710,6 +2175,7 @@ SWITCH_DECLARE(int) tnt_session_execute(tnt_session_t *s, const char *sql,
 			int pc = tnt_conn_precheck(&s->conn);
 
 			if (pc != 0) {
+				cb_report_cur(s, 0);
 				tnt_session_mark_broken(s);
 				tnt_conn_close(&s->conn);
 				if (!retryable)
@@ -1721,10 +2187,13 @@ SWITCH_DECLARE(int) tnt_session_execute(tnt_session_t *s, const char *sql,
 	}
 
 	rc = tnt_conn_execute(&s->conn, sql, res);
-	if (rc == 0 || rc == 1)
-		return rc;				/* success or deterministic SQL error */
+	if (rc == 0 || rc == 1) {
+		cb_report_cur(s, 1);	/* success or deterministic SQL error */
+		return rc;
+	}
 
 	/* transport failure */
+	cb_report_cur(s, 0);
 	tnt_session_mark_broken(s);
 	tnt_conn_close(&s->conn);
 	if (!retryable)
@@ -1733,7 +2202,21 @@ SWITCH_DECLARE(int) tnt_session_execute(tnt_session_t *s, const char *sql,
 	if (tnt_session_open(s) < 0)
 		return -1;
 	/* retry once on the (possibly different) host */
-	return tnt_conn_execute(&s->conn, sql, res);
+	rc = tnt_conn_execute(&s->conn, sql, res);
+	if (rc == 0 || rc == 1)
+		cb_report_cur(s, 1);
+	else
+		cb_report_cur(s, 0);
+	return rc;
+}
+
+SWITCH_DECLARE(int) tnt_session_exec_prepared(tnt_session_t *s, uint32_t stmt_id,
+											  const uint8_t *bind, size_t bind_len,
+											  tnt_result_t *res)
+{
+	if (s->conn.fd < 0)
+		return -1;				/* no current conn: caller falls back */
+	return tnt_conn_exec_stmt(&s->conn, stmt_id, bind, bind_len, res);
 }
 
 SWITCH_DECLARE(int) tnt_session_ping(tnt_session_t *s)

@@ -1,32 +1,32 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* mp_decode.c -- minimal MessagePack decoder/encoder
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * mp_decode.c -- minimal MessagePack decoder/encoder
+ *
+ */
 
 #include "mp_decode.h"
 
@@ -383,6 +383,11 @@ SWITCH_DECLARE(size_t) tnt_mp_writer_len(const tnt_mp_writer_t *w)
 	return w->len;
 }
 
+SWITCH_DECLARE(int) tnt_mp_write_bytes(tnt_mp_writer_t *w, const void *data, size_t n)
+{
+	return wput(w, data, n);
+}
+
 SWITCH_DECLARE(int) tnt_mp_write_nil(tnt_mp_writer_t *w)
 {
 	return wbyte(w, 0xc0);
@@ -460,6 +465,20 @@ SWITCH_DECLARE(int) tnt_mp_write_int(tnt_mp_writer_t *w, int64_t v)
 			buf[1 + i] = (uint8_t)((uint64_t)v >> (56 - 8 * i));
 		return wput(w, buf, 9);
 	}
+}
+
+SWITCH_DECLARE(int) tnt_mp_write_double(tnt_mp_writer_t *w, double v)
+{
+	uint8_t h[9];
+	uint64_t bits;
+	int i;
+
+	h[0] = 0xcb;				/* msgpack float64 */
+	bits = 0;
+	memcpy(&bits, &v, sizeof(bits));	/* host order -> we swap below */
+	for (i = 0; i < 8; i++)
+		h[1 + i] = (uint8_t)(bits >> (8 * (7 - i)));
+	return wput(w, h, sizeof(h));
 }
 
 SWITCH_DECLARE(int) tnt_mp_write_str(tnt_mp_writer_t *w, const char *s, size_t n)

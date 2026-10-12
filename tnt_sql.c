@@ -1,32 +1,32 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* tnt_sql.c -- statement splitter and classifier
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * tnt_sql.c -- statement splitter and classifier
+ *
+ */
 
 #include "tnt_sql.h"
 
@@ -542,6 +542,223 @@ done:
 	return o;
 }
 
+/* ------------------------------------------------------------------ */
+/* statement templateize (translate-cache key layer)                   */
+/* ------------------------------------------------------------------ */
+
+static int tpl_put(char *tpl, size_t cap, size_t *n, char c)
+{
+	if (*n + 1 >= cap)
+		return -1;
+	tpl[(*n)++] = c;
+	return 0;
+}
+
+static int tpl_val_store(tnt_sql_val_t *vals, int maxvals, int *nvals,
+						 const char *payload, size_t plen, int is_string)
+{
+	tnt_sql_val_t *v;
+
+	if (*nvals >= maxvals)
+		return -1;			/* too many literals -> uncacheable */
+	if (plen >= TNT_SQL_VAL_MAX)
+		return -1;			/* payload too long -> uncacheable */
+	v = &vals[(*nvals)++];
+	memcpy(v->text, payload, plen);
+	v->text[plen] = '\0';
+	v->is_string = is_string;
+	return 0;
+}
+
+SWITCH_DECLARE(int) tnt_sql_templateize(const char *sql, size_t start, size_t end,
+										char *tpl, size_t tplcap,
+										tnt_sql_val_t *vals, int maxvals, int *nvals)
+{
+	size_t p = start, n = 0;
+	int prev_ident = 0;		/* last copied char was part of a name */
+	enum { T_NORM, T_SQ, T_DQ, T_LC, T_BC } st = T_NORM;
+
+	*nvals = 0;
+
+	while (p < end) {
+		char c = sql[p];
+
+		switch (st) {
+		case T_NORM:
+			if (c == '\'') {
+				/* single-quoted data literal: collect the unescaped payload */
+				{
+					char payload[TNT_SQL_VAL_MAX];
+					size_t pl = 0;
+
+					p++;
+					while (p < end) {
+						if (sql[p] == '\'') {
+							if (p + 1 < end && sql[p + 1] == '\'') {
+								if (pl + 1 < sizeof(payload))
+									payload[pl++] = '\'';
+								p += 2;
+								continue;
+							}
+							break;	/* closing quote */
+						}
+						if (pl + 1 < sizeof(payload))
+							payload[pl++] = sql[p];
+						p++;
+					}
+					if (p >= end)
+						return -1;	/* unterminated literal */
+					if (tpl_val_store(vals, maxvals, nvals, payload, pl, 1))
+						return -1;
+					if (tpl_put(tpl, tplcap, &n, TNT_SQL_TPL_MARK))
+						return -1;
+					prev_ident = 0;
+					p++;
+					continue;
+				}
+			} else if (c == '"') {
+				/* quoted identifier: copy verbatim, including the quotes */
+				st = T_DQ;
+				if (tpl_put(tpl, tplcap, &n, c))
+					return -1;
+			} else if (c == '-' && p + 1 < end && sql[p + 1] == '-') {
+				st = T_LC;
+				p++;
+			} else if (c == '/' && p + 1 < end && sql[p + 1] == '*') {
+				st = T_BC;
+				p++;
+			} else if ((c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+						c == '\f' || c == '\v')) {
+				/* collapse whitespace runs to a single space */
+				if (n && tpl[n - 1] != ' ') {
+					if (tpl_put(tpl, tplcap, &n, ' '))
+						return -1;
+				}
+			} else if (c == '\001') {
+				return -1;	/* marker byte in the source -> uncacheable */
+			} else if (c >= '0' && c <= '9' && !prev_ident) {
+				/* bare number start -> data literal */
+				{
+					char payload[TNT_SQL_VAL_MAX];
+					size_t pl = 0;
+
+					while (p < end && ((sql[p] >= '0' && sql[p] <= '9') ||
+									   sql[p] == '.' || sql[p] == 'x' ||
+									   sql[p] == 'X' ||
+									   (sql[p] >= 'a' && sql[p] <= 'f') ||
+									   (sql[p] >= 'A' && sql[p] <= 'F'))) {
+						if (pl + 1 < sizeof(payload))
+							payload[pl++] = sql[p];
+						p++;
+					}
+					if (tpl_val_store(vals, maxvals, nvals, payload, pl, 0))
+						return -1;
+					if (tpl_put(tpl, tplcap, &n, TNT_SQL_TPL_MARK))
+						return -1;
+					prev_ident = 0;
+					continue;
+				}
+			} else {
+				char lc = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+
+				if (tpl_put(tpl, tplcap, &n, lc))
+					return -1;
+				prev_ident = is_ident_char(c);
+			}
+			break;
+		case T_DQ:
+			/* quoted identifier: verbatim (part of the schema shape) */
+			if (tpl_put(tpl, tplcap, &n, c))
+				return -1;
+			if (c == '"') {
+				if (p + 1 < end && sql[p + 1] == '"') {
+					p++;
+					if (tpl_put(tpl, tplcap, &n, '"'))
+						return -1;
+				} else {
+					st = T_NORM;
+				}
+			}
+			break;
+		case T_SQ:
+			/* unreachable: handled inline at the opening quote */
+			st = T_NORM;
+			break;
+		case T_LC:
+			if (c == '\n')
+				st = T_NORM;
+			break;
+		case T_BC:
+			if (c == '*' && p + 1 < end && sql[p + 1] == '/') {
+				p++;
+				st = T_NORM;
+			}
+			break;
+		}
+		p++;
+	}
+
+	tpl[n] = '\0';
+	return 0;
+}
+
+SWITCH_DECLARE(int) tnt_sql_rebuild(const char *tpl, const tnt_sql_val_t *vals,
+									int nvals, char *out, size_t cap)
+{
+	size_t p = 0, n = 0, len = strlen(tpl);
+	int vi = 0;
+
+	while (p < len) {
+		char c = tpl[p];
+
+		if (c == TNT_SQL_TPL_MARK) {
+			const tnt_sql_val_t *v;
+
+			if (vi >= nvals)
+				return -1;	/* template/vals mismatch */
+			v = &vals[vi++];
+			if (v->is_string) {
+				size_t k;
+
+				if (n + 1 >= cap)
+					return -1;
+				out[n++] = '\'';
+				for (k = 0; v->text[k]; k++) {
+					if (v->text[k] == '\'') {
+						if (n + 2 >= cap)
+							return -1;
+						out[n++] = '\'';
+						out[n++] = '\'';
+					} else {
+						if (n + 1 >= cap)
+							return -1;
+						out[n++] = v->text[k];
+					}
+				}
+				if (n + 1 >= cap)
+					return -1;
+				out[n++] = '\'';
+			} else {
+				size_t k;
+
+				for (k = 0; v->text[k]; k++) {
+					if (n + 1 >= cap)
+						return -1;
+					out[n++] = v->text[k];
+				}
+			}
+			p++;
+			continue;
+		}
+		if (n + 1 >= cap)
+			return -1;
+		out[n++] = c;
+		p++;
+	}
+	out[n] = '\0';
+	return vi == nvals ? 0 : -1;	/* every value must be consumed */
+}
+
 static int tnt_sql_is_keyword(const char *s, size_t len)
 {
 	static const char *const keywords[] = {
@@ -705,4 +922,184 @@ SWITCH_DECLARE(int) tnt_sql_validate(const char *sql, int want_select,
 	if (reason && reason_cap > 0)
 		snprintf(reason, reason_cap, "%s", msg);
 	return -1;
+}
+
+SWITCH_DECLARE(int) tnt_sql_tpl_qmarks(const char *tpl, char *out, size_t cap)
+{
+	size_t i, n = 0;
+
+	if (!tpl || !out || cap == 0)
+		return -1;
+	for (i = 0; tpl[i]; i++) {
+		char ch = (tpl[i] == TNT_SQL_TPL_MARK) ? '?' : tpl[i];
+
+		if (n + 2 > cap)
+			return -1;
+		out[n++] = ch;
+	}
+	out[n] = '\0';
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* SELECT-list literal materialization (PREPARE typing workaround)     */
+/* ------------------------------------------------------------------ */
+
+/* Position of the first FROM keyword in a statement template, outside
+ * double-quoted identifiers and comments, or SIZE_MAX when absent. The
+ * template carries marker bytes instead of string literals, so only
+ * "..." identifiers and line/block comments need skipping. */
+static size_t tnt_sql_find_from(const char *tpl, size_t len)
+{
+	enum { F_NORM, F_DQ, F_LC, F_BC } st = F_NORM;
+	size_t p = 0;
+
+	while (p < len) {
+		char c = tpl[p];
+
+		switch (st) {
+		case F_NORM:
+			if (c == '"') {
+				st = F_DQ;
+			} else if (c == '-' && p + 1 < len && tpl[p + 1] == '-') {
+				st = F_LC;
+				p++;
+			} else if (c == '/' && p + 1 < len && tpl[p + 1] == '*') {
+				st = F_BC;
+				p++;
+			} else if ((c == 'f' || c == 'F') &&
+					   (p == 0 || !is_ident_char(tpl[p - 1])) &&
+					   p + 4 <= len &&
+					   (tpl[p + 1] == 'r' || tpl[p + 1] == 'R') &&
+					   (tpl[p + 2] == 'o' || tpl[p + 2] == 'O') &&
+					   (tpl[p + 3] == 'm' || tpl[p + 3] == 'M') &&
+					   (p + 4 == len || !is_ident_char(tpl[p + 4]))) {
+				return p;
+			}
+			break;
+		case F_DQ:
+			if (c == '"') {
+				if (p + 1 < len && tpl[p + 1] == '"') {
+					p++;
+				} else {
+					st = F_NORM;
+				}
+			}
+			break;
+		case F_LC:
+			if (c == '\n')
+				st = F_NORM;
+			break;
+		case F_BC:
+			if (c == '*' && p + 1 < len && tpl[p + 1] == '/') {
+				p++;
+				st = F_NORM;
+			}
+			break;
+		}
+		p++;
+	}
+	return SIZE_MAX;
+}
+
+SWITCH_DECLARE(int) tnt_sql_has_select_markers(const char *tpl, size_t len)
+{
+	size_t p = 0, from, limit;
+
+	if (!tpl)
+		return 0;
+	/* only SELECT statements have a SELECT list to materialize */
+	while (p < len && (tpl[p] == ' ' || tpl[p] == '\t' || tpl[p] == '\r' ||
+					   tpl[p] == '\n' || tpl[p] == '\f' || tpl[p] == '\v'))
+		p++;
+	if (len - p < 6 ||
+		!((tpl[p] == 's' || tpl[p] == 'S') &&
+		  (tpl[p + 1] == 'e' || tpl[p + 1] == 'E') &&
+		  (tpl[p + 2] == 'l' || tpl[p + 2] == 'L') &&
+		  (tpl[p + 3] == 'e' || tpl[p + 3] == 'E') &&
+		  (tpl[p + 4] == 'c' || tpl[p + 4] == 'C') &&
+		  (tpl[p + 5] == 't' || tpl[p + 5] == 'T')))
+		return 0;
+	if (p + 6 < len && is_ident_char(tpl[p + 6]))
+		return 0;	/* "selectx" is not the keyword */
+
+	from = tnt_sql_find_from(tpl, len);
+	limit = (from == SIZE_MAX) ? len : from;
+	for (p = 0; p < limit; p++) {
+		if (tpl[p] == TNT_SQL_TPL_MARK)
+			return 1;
+	}
+	return 0;
+}
+
+SWITCH_DECLARE(int) tnt_sql_materialize_select(const char *tpl, tnt_sql_val_t *vals,
+											   int *nvals, char *out, size_t cap)
+{
+	size_t p = 0, n = 0, len = strlen(tpl);
+	size_t from = tnt_sql_find_from(tpl, len);
+	size_t limit = (from == SIZE_MAX) ? len : from;
+	int vi = 0;
+
+	if (!tpl || !vals || !nvals || !out || cap == 0)
+		return -1;
+
+	while (p < len) {
+		char c = tpl[p];
+
+		if (c == TNT_SQL_TPL_MARK && p < limit) {
+			const tnt_sql_val_t *v;
+
+			if (vi >= *nvals)
+				return -1;	/* template/vals mismatch */
+			v = &vals[vi++];
+			if (v->is_string) {
+				size_t k;
+
+				if (n + 1 >= cap)
+					return -1;
+				out[n++] = '\'';
+				for (k = 0; v->text[k]; k++) {
+					if (v->text[k] == '\'') {
+						if (n + 2 >= cap)
+							return -1;
+						out[n++] = '\'';
+						out[n++] = '\'';
+					} else {
+						if (n + 1 >= cap)
+							return -1;
+						out[n++] = v->text[k];
+					}
+				}
+				if (n + 1 >= cap)
+					return -1;
+				out[n++] = '\'';
+			} else {
+				size_t k;
+
+				for (k = 0; v->text[k]; k++) {
+					if (n + 1 >= cap)
+						return -1;
+					out[n++] = v->text[k];
+				}
+			}
+			p++;
+			continue;
+		}
+		if (n + 1 >= cap)
+			return -1;
+		out[n++] = c;
+		p++;
+	}
+	out[n] = '\0';
+
+	/* compact vals: drop the materialized SELECT-list values (only after
+	 * the whole scan succeeded, so a failure leaves vals untouched) */
+	if (vi > 0) {
+		int left = *nvals - vi;
+
+		if (left > 0)
+			memmove(vals, vals + vi, (size_t)left * sizeof(*vals));
+		*nvals = left;
+	}
+	return 0;
 }

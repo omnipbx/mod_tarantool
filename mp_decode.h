@@ -1,39 +1,39 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* mp_decode.h -- minimal MessagePack decoder/encoder (msgpack.org spec, no
-* external dependencies). Used to talk the Tarantool binary protocol:
-*   - decode: responses (MAP/ARRAY/STR/INT/UINT/BOOL/NIL/DBL/BIN)
-*   - encode: request bodies (IPROTO map with uint keys and str values)
-*
-* All integer types are read in network byte order. Binary data returned by
-* the decoder is borrowed (points into the source buffer); callers must copy
-* it if they need it to outlive the buffer.
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * mp_decode.h -- minimal MessagePack decoder/encoder (msgpack.org spec, no
+ * external dependencies). Used to talk the Tarantool binary protocol:
+ *   - decode: responses (MAP/ARRAY/STR/INT/UINT/BOOL/NIL/DBL/BIN)
+ *   - encode: request bodies (IPROTO map with uint keys and str values)
+ *
+ * All integer types are read in network byte order. Binary data returned by
+ * the decoder is borrowed (points into the source buffer); callers must copy
+ * it if they need it to outlive the buffer.
+ *
+ */
 
 #ifndef TNT_MP_DECODE_H
 #define TNT_MP_DECODE_H
@@ -100,8 +100,11 @@ SWITCH_DECLARE(void) tnt_mp_writer_init(tnt_mp_writer_t *w, void *buf, size_t ca
 SWITCH_DECLARE(size_t) tnt_mp_writer_len(const tnt_mp_writer_t *w);
 SWITCH_DECLARE(int) tnt_mp_write_nil(tnt_mp_writer_t *w);
 SWITCH_DECLARE(int) tnt_mp_write_bool(tnt_mp_writer_t *w, int b);
+/* Append n raw bytes (used for a pre-encoded msgpack bind array). */
+SWITCH_DECLARE(int) tnt_mp_write_bytes(tnt_mp_writer_t *w, const void *data, size_t n);
 SWITCH_DECLARE(int) tnt_mp_write_uint(tnt_mp_writer_t *w, uint64_t v);
 SWITCH_DECLARE(int) tnt_mp_write_int(tnt_mp_writer_t *w, int64_t v);
+SWITCH_DECLARE(int) tnt_mp_write_double(tnt_mp_writer_t *w, double v);
 SWITCH_DECLARE(int) tnt_mp_write_str(tnt_mp_writer_t *w, const char *s, size_t n);
 SWITCH_DECLARE(int) tnt_mp_write_map_header(tnt_mp_writer_t *w, uint32_t n);
 SWITCH_DECLARE(int) tnt_mp_write_array_header(tnt_mp_writer_t *w, uint32_t n);

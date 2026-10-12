@@ -6,6 +6,9 @@ mod_tarantool_la_SOURCES = mod_tarantool.c \
 	tnt_client.c tnt_client.h \
 	tnt_sql.c tnt_sql.h \
 	tnt_rules.c tnt_rules.h \
+	tnt_stats.c tnt_stats.h \
+	tnt_tcache.c tnt_tcache.h \
+	circuit_breaker.c circuit_breaker.h \
 	mp_decode.c mp_decode.h
 
 mod_tarantool_la_CFLAGS  = $(AM_CFLAGS) -std=gnu99 -D_GNU_SOURCE -Wno-error=pedantic

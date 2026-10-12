@@ -1,32 +1,32 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* tnt_rules.c -- declarative DDL translation
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * tnt_rules.c -- declarative DDL translation
+ *
+ */
 
 #include "tnt_rules.h"
 
@@ -829,7 +829,7 @@ typedef struct inj_col {
  * Multi-row INSERTs and statements that already list the columns are left
  * unchanged (NULL). Returns a malloc'ed rewritten statement or NULL. */
 static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
-								   const tnt_translate_ctx_t *ctx)
+								   tnt_translate_ctx_t *ctx)
 {
 	const tnt_pkadd_rule_t *pa = find_pkadd(r, st->table);
 	const tnt_addfield_rule_t *af = NULL;
@@ -903,6 +903,9 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 		}
 		snprintf(inj[ninj].field, sizeof(inj[ninj].field), "%s", pa->field);
 		if (cu && ctx && ctx->core_uuid) {
+			/* a per-call literal UUID: the translated text differs on every
+			 * call -> mark ctx-dependent (never store in the cache) */
+			ctx->ctx_dep = 1;
 			if (isu)
 				snprintf(inj[ninj].expr, sizeof(inj[ninj].expr),
 						 "CAST('%s' AS UUID)", ctx->core_uuid);
@@ -947,6 +950,8 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 			memcpy(nm, val + off, vlen - off - 1);
 			nm[vlen - off - 1] = '\0';
 			rv = (ctx && ctx->resolver) ? ctx->resolver(nm, ctx->ud) : NULL;
+			if (rv && ctx)
+				ctx->ctx_dep = 1;	/* resolved value may change over time */
 			if (!rv) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 								  "mod_tarantool: %s.%s value %s unresolved, "
@@ -1299,7 +1304,7 @@ static char *expand_view_select(const tnt_rules_t *r, const tnt_stmt_t *st)
 }
 
 SWITCH_DECLARE(char *) tnt_rules_translate(const tnt_rules_t *r, const tnt_stmt_t *st,
-										   int server_major, const tnt_translate_ctx_t *ctx,
+										   int server_major, tnt_translate_ctx_t *ctx,
 										   int *is_noop)
 {
 	*is_noop = 0;
@@ -1318,6 +1323,11 @@ SWITCH_DECLARE(char *) tnt_rules_translate(const tnt_rules_t *r, const tnt_stmt_
 		{
 			char *inj = inject_insert_columns(r, st, ctx);
 
+			/* intColumns cast rewrites the literal shape ('' -> NULL,
+			 * CAST(...) wrapping) and depends on the literal values, so
+			 * such statements must not be cached on the template key */
+			if (r->nintcols > 0 && ctx)
+				ctx->ctx_dep = 1;
 			if (inj) {
 				char *c = cast_insert_values(r, inj);
 
@@ -1343,11 +1353,17 @@ SWITCH_DECLARE(char *) tnt_rules_translate(const tnt_rules_t *r, const tnt_stmt_
 				}
 			}
 		}
-		/* FALLTHROUGH: no rewrite matched, pass through */
+		__attribute__((fallthrough));
+		/* no rewrite matched, pass through */
 	case TNT_STMT_UPDATE:
 		{
-			char *fixed = fix_bigint(st->sql + st->start, st->end - st->start);
+			char *fixed;
 			char *c;
+
+			/* intColumns UPDATE cast depends on literal values -> uncacheable */
+			if (r->nintcols > 0 && ctx)
+				ctx->ctx_dep = 1;
+			fixed = fix_bigint(st->sql + st->start, st->end - st->start);
 
 			if (!fixed)
 				return NULL;
@@ -1365,7 +1381,8 @@ SWITCH_DECLARE(char *) tnt_rules_translate(const tnt_rules_t *r, const tnt_stmt_
 			if (exp)
 				return exp;
 		}
-		/* FALLTHROUGH: plain select without a declared view */
+		__attribute__((fallthrough));
+		/* plain select without a declared view */
 	case TNT_STMT_ALTER_TABLE:
 	default:
 		/* passthrough (ALTER ADD COLUMN, DML) with BIGINT -> INTEGER */

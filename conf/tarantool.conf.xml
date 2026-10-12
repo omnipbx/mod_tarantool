@@ -20,6 +20,23 @@
     <!-- SQL tracing of every request (SQL-in from the core, SQL-out to
          Tarantool). Can be toggled at runtime with 'tarantool debug'. -->
     <param name="debug" value="false"/>
+    <!-- Statement translate cache (repeat SQL templates skip
+         split/translate/quote; invalidated on every reload of the rules).
+         false = bypass + clear (kill-switch). Hot-togglable with
+         'tarantool cache on|off'. -->
+    <param name="cache" value="false"/>
+    <!-- Shared circuit breaker (per-host, keyed by addr:port; global across
+         all profiles/pools). Protects the FreeSWITCH core from tight
+         retry loops when a Tarantool host goes down.
+         cb-mode: off  - classic per-conn exponential backoff (v1.0.5);
+                  wait - OPEN blocks requests until the window ends (safe
+                         for switch_cache_db_test_reactive; default);
+                  fast - OPEN fails requests immediately (opt-in).
+         cb-failure-threshold: consecutive transport failures before OPEN.
+         cb-timeout: OPEN window length, ms. -->
+    <param name="cb-mode" value="wait"/>
+    <param name="cb-failure-threshold" value="3"/>
+    <param name="cb-timeout" value="5000"/>
   </settings>
 
   <!-- TLS client profiles.
@@ -67,6 +84,21 @@
       <param name="port" value="3301"/> -->
       <param name="user" value="freeswitch"/>
       <param name="password" value="P@ssw0rd"/>
+      <!-- Prepared statements (stage 2): cacheable SELECT/INSERT/UPDATE/
+           DELETE templates are executed via IPROTO_PREPARE + bind.
+           PROFILE-level default for all hosts of this profile; a host-level
+           <param name="prepare"/> inside <host> overrides it. The REAL
+           server version is taken from the greeting: on servers older than
+           2.11 (no box.prepare) the statement transparently falls back to
+           the plain path. Runtime override until reconnect:
+           'tarantool prepare on|off'. -->
+      <param name="prepare" value="false"/>
+      <!-- Connection pool: how many independent connections this handle
+           keeps (1..8). Statements are distributed round-robin; each
+           connection has its own failover state and prepared-statement
+           cache, so pool-size>1 runs concurrent statements in parallel.
+           1 (default) = classic one-connection-per-handle. -->
+      <param name="pool-size" value="1"/>
       <param name="connect-timeout" value="2000"/>
       <param name="query-timeout" value="3000"/>
       <param name="full-scan" value="true"/>

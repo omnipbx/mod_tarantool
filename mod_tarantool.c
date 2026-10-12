@@ -1,45 +1,45 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* mod_tarantool.c -- Tarantool Core DB driver module
-*
-* Implements the switch_database_interface so that FreeSWITCH's Core DB
-* (channels/calls/registrations and everything routed through
-* switch_core_db_*) can run on Tarantool's SQL over the IPROTO binary
-* protocol, without ODBC/libtarantool.
-*
-* Features (v1):
-*   - profiles: independent connection pools keyed by DSN (tarantool://<name>)
-*   - unix-socket / TCP, chap-sha1 auth, bounded timeouts
-*   - multi-host failover with exponential backoff; SELECT-only retry
-*   - declarative DDL translation (primaryKey / primaryKeyAdd / addField)
-*   - batch statement execution for sofia-style "stmt1;stmt2" SQL strings
-*   - API: tarantool status|list|stats|ping|sql|translate|reload|drop|version|help
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * mod_tarantool.c -- Tarantool Core DB driver module
+ *
+ * Implements the switch_database_interface so that FreeSWITCH's Core DB
+ * (channels/calls/registrations and everything routed through
+ * switch_core_db_*) can run on Tarantool's SQL over the IPROTO binary
+ * protocol, without ODBC/libtarantool.
+ *
+ * Features (v1):
+ *   - profiles: independent connection pools keyed by DSN (tarantool://<name>)
+ *   - unix-socket / TCP, chap-sha1 auth, bounded timeouts
+ *   - multi-host failover with exponential backoff; SELECT-only retry
+ *   - declarative DDL translation (primaryKey / primaryKeyAdd / addField)
+ *   - batch statement execution for sofia-style "stmt1;stmt2" SQL strings
+ *   - API: tarantool status|list|stats|ping|sql|translate|debug|sqlstats|cache|prepare|reload|drop|version|help
+ *
+ */
 
 #include <switch.h>
 
@@ -52,6 +52,8 @@
 #include "tnt_client.h"
 #include "tnt_rules.h"
 #include "tnt_sql.h"
+#include "tnt_stats.h"
+#include "tnt_tcache.h"
 
 switch_loadable_module_interface_t *MODULE_INTERFACE;
 
@@ -87,20 +89,41 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.3"
+#define TNT_VERSION	"1.0.7"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
 	char sql[TNT_MAINT_SQL_LEN];	/* one or more ';'-separated statements */
 } tnt_maint_sql_t;
 
-/* Per-handle connection context (one TCP/unix connection per handle). */
+/* Per-handle connection context. Each handle owns a small pool of
+ * independent sessions (tnt_session_t: one TCP/unix connection plus its
+ * own failover state and prepared-statement cache); statements are
+ * distributed round-robin. pool-size=1 (the default) reproduces the
+ * classic one-connection-per-handle behaviour. */
 typedef struct tnt_handle {
 	char profile_name[64];
 	tnt_profile_cfg_t profile;	/* deep copy at handle_new time */
-	tnt_rules_t rules;			/* deep copy at handle_new time */
-	switch_mutex_t *lock;		/* serializes SQL calls vs the reload rules swap */
-	tnt_session_t session;
+	tnt_rules_t *rules;			/* immutable rules snapshot (atomically
+								 * swapped on reload; retired via the
+								 * glob grace list once in-flight readers
+								 * are done) */
+	uint32_t rules_epoch;		/* glob->rules_epoch snapshot; a mismatch
+								 * triggers the lazy rules refresh */
+	switch_mutex_t *lock;		/* short critical sections only: session
+								 * pick (round-robin cursor), transaction
+								 * pinning, first-callsite recording, CLI
+								 * access to the pool. NOT held across SQL
+								 * execution - that is the per-conn lock */
+	tnt_session_t sessions[TNT_POOL_MAX];	/* the connection pool */
+	int pool_size;				/* effective size (1..TNT_POOL_MAX) */
+	int rr;						/* round-robin cursor (under h->lock) */
+	int tx_pinned;				/* 1 = a transaction is in progress: all
+								 * statements go to sessions[tx_idx] */
+	int tx_idx;					/* pinned session index (under h->lock) */
+	switch_mutex_t *conn_locks[TNT_POOL_MAX];	/* per-connection mutex:
+								 * serializes statements on ONE conn, so
+								 * pool_size>1 runs statements in parallel */
 	switch_bool_t auto_commit;
 	int affected_rows;
 	uint64_t n_queries;			/* total statements sent through this handle */
@@ -121,6 +144,18 @@ typedef struct tnt_tls_profile {
 	int verify_host;			/* 1 = also verify the hostname */
 	char min_version[16];		/* e.g. "TLSv1.2" */
 } tnt_tls_profile_t;
+
+/* Retired immutable rules snapshot: it may still be read by in-flight
+ * statements (the exec path reads h->rules without any lock), so it is
+ * freed only after a grace period. Reloads are rare (manual), so the
+ * list is almost always empty. */
+#define TNT_RULES_RETIRED_MAX	16
+#define TNT_RULES_RETIRE_MS		60000
+
+typedef struct tnt_rules_retired {
+	tnt_rules_t *rules;
+	int64_t retired_mono;		/* CLOCK_MONOTONIC ms */
+} tnt_rules_retired_t;
 
 /* ------------------------------------------------------------------ */
 /* global configuration snapshot                                       */
@@ -148,6 +183,33 @@ typedef struct tnt_global {
 	char debug_profile[64];		/* optional per-profile filter */
 	tnt_handle_t *handles[TNT_HANDLES_MAX];
 	int nhandles;
+	tnt_stats_t stats;			/* "tarantool sqlstats" runtime counters */
+	switch_mutex_t *stats_mutex;/* serializes stats mutation vs accounting */
+	uint32_t rules_epoch;		/* bumped on every rules swap; handles
+								 * refresh lazily on their next SQL call */
+	/* statement translate cache ("tarantool cache ..."): dynamic,
+	 * self-populating, keyed by the raw statement text hash; invalidated
+	 * wholesale on every rules swap */
+	int cache_cfg;				/* <param name="cache"/> (config value) */
+	tnt_tcache_t tcache;
+	switch_mutex_t *cache_mutex;/* serializes cache mutation vs lookup */
+	/* prepared statements ("tarantool prepare ...", stage 2): the per-conn
+	 * stmt_id cache lives in tnt_conn_t; these are the module-wide
+	 * counters (all mutated under cache_mutex) */
+	uint64_t p_prepares;		/* IPROTO_PREPARE requests sent */
+	uint64_t p_execs;			/* statements executed via a prepared stmt */
+	uint64_t p_phits;			/* per-conn prep-cache hits */
+	uint64_t p_fallbacks;		/* prepared -> plain-path fallbacks */
+	uint64_t p_errors;			/* PREPARE refused by the server */
+	/* retired immutable rules snapshots (all mutations under glob->mutex) */
+	tnt_rules_retired_t rules_retired[TNT_RULES_RETIRED_MAX];
+	int nrules_retired;
+	/* shared circuit breaker (<settings> cb-mode / cb-failure-threshold /
+	 * cb-timeout). The per-host breaker registry itself lives in
+	 * tnt_client.c; these values are pushed into it by config_load(). */
+	int cb_mode;				/* cb_mode_t */
+	int cb_failure_threshold;
+	int64_t cb_timeout_ms;
 } tnt_global_t;
 
 static tnt_global_t *glob = NULL;
@@ -215,6 +277,11 @@ static void parse_host_params(switch_xml_t xml, tnt_host_cfg_t *h,
 			/* v1.1 placeholder: parsed/stored but NOT used yet — the
 			 * connection is still plain TCP/unix. See TNT_PROFILES_TLS_MAX. */
 			snprintf(h->tls_profile, sizeof(h->tls_profile), "%s", value);
+		} else if (!strcasecmp(name, "prepare")) {
+			/* prepared statements (stage 2) for THIS host; in the inline
+			 * profile form this also acts as the profile default. -1 =
+			 * unset (inherit from the profile), resolved after parsing */
+			h->prepare = parse_bool_attr(value, -1);
 		} else if (!strcasecmp(name, "full-scan") || !strcasecmp(name, "init-sql")) {
 			/* These are PROFILE-level parameters: they apply to every host
 			 * of the profile (incl. failover reconnects) and must be placed
@@ -243,6 +310,7 @@ static void parse_profile(switch_xml_t xml, tnt_profile_cfg_t *p)
 	p->ping_idle_s = 30;
 	p->ping_timeout_s = 3;
 	p->backoff_max_s = 30;
+	p->pool_size = 1;			/* 1 = classic one-conn-per-handle */
 	p->skip_index = (skip_index && !strcasecmp(skip_index, "true")) ? 1 : 0;
 	/* FreeSWITCH core queries are full table scans by default and Tarantool
 	 * forbids them unless enabled per session — see task 27. On by default. */
@@ -265,7 +333,19 @@ static void parse_profile(switch_xml_t xml, tnt_profile_cfg_t *p)
 			p->ping_timeout_s = parse_ms(pv, p->ping_timeout_s) / 1000;
 		else if (!strcasecmp(pn, "backoff-max"))
 			p->backoff_max_s = parse_ms(pv, p->backoff_max_s) / 1000;
-		else if (!strcasecmp(pn, "full-scan"))
+		else if (!strcasecmp(pn, "prepare"))
+			p->prepare = parse_bool_attr(pv, 0);
+		else if (!strcasecmp(pn, "pool-size")) {
+			int ps = atoi(pv);
+
+			p->pool_size = ps > 0 ? ps : 1;
+			if (p->pool_size > TNT_POOL_MAX) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: profile '%s': pool-size %d exceeds the maximum %d, clamped\n",
+								  p->name[0] ? p->name : "(unnamed)", ps, TNT_POOL_MAX);
+				p->pool_size = TNT_POOL_MAX;
+			}
+		} else if (!strcasecmp(pn, "full-scan"))
 			p->full_scan = parse_bool_attr(pv, 1);
 		else if (!strcasecmp(pn, "init-sql"))
 			snprintf(p->init_sql, sizeof(p->init_sql), "%s", pv);
@@ -292,6 +372,7 @@ static void parse_profile(switch_xml_t xml, tnt_profile_cfg_t *p)
 			hv = switch_xml_attr(xml_host, "version");
 			memset(h, 0, sizeof(*h));
 			h->port = 3301;
+			h->prepare = -1;	/* -1 = not set: inherit from the profile */
 			if (hv)
 				snprintf(h->version, sizeof(h->version), "%s", hv);
 			parse_host_params(xml_host, h, &p->query_timeout_ms, huser, sizeof(huser), hpass, sizeof(hpass));
@@ -314,12 +395,24 @@ static void parse_profile(switch_xml_t xml, tnt_profile_cfg_t *p)
 		(void)hn;
 		memset(h, 0, sizeof(*h));
 		h->port = 3301;
+		h->prepare = -1;		/* -1 = not set: inherit from the profile */
 		if (version)
 			snprintf(h->version, sizeof(h->version), "%s", version);
 		parse_host_params(xml, h, &p->query_timeout_ms, p->username, sizeof(p->username),
 						  p->password, sizeof(p->password));
 		if (h->addr[0])
 			p->nhosts = 1;
+	}
+
+	/* resolve inheritance: hosts without their own <param name="prepare"/>
+		* take the profile default (already the same value in the inline form) */
+	{
+		int hi;
+
+		for (hi = 0; hi < p->nhosts; hi++) {
+			if (p->hosts[hi].prepare < 0)
+				p->hosts[hi].prepare = p->prepare;
+		}
 	}
 }
 
@@ -418,6 +511,166 @@ static int tnt_reserved_snapshot(const tnt_rules_t *r, char (*out)[TNT_RESERVED_
 	return n;
 }
 
+/* Copy the first ${...} / $${...} token of sql into tok (NUL-terminated).
+ * Returns 1 when a placeholder was found. */
+static int first_placeholder(const char *sql, char *tok, size_t tokcap)
+{
+	const char *p = sql;
+
+	while ((p = strchr(p, '$')) != NULL) {
+		const char *start = (*p == '$' && *(p + 1) == '$') ? p + 1 : p;
+		const char *e;
+
+		if (strncmp(start, "${", 2)) {
+			p++;
+			continue;
+		}
+		e = strchr(start + 2, '}');
+		if (!e)
+			e = start + strlen(start);
+		snprintf(tok, tokcap, "%.*s", (int)(e - start + 1), start);
+		return 1;
+	}
+	return 0;
+}
+
+/* Expand dynamic variables in a <maintenance> <sql> body:
+ *   ${now}                     -> (long) now
+ *   ${epoch}                   -> (long) now
+ *   ${hostname} ${switchname}  -> switch name
+ *   ${strftime(<fmt>)}         -> current time formatted with <fmt>
+ * String literals '...' are copied verbatim (expansion never touches quoted
+ * content). On an unknown variable / strftime error the function returns -1
+ * and copies the offending token into badvar; out is NUL-terminated. */
+/* Build the offending-token diagnostic "${<name>}" ("${<name>" for an
+ * unterminated placeholder) bounded by cap. The runtime precision keeps the
+ * worst-case output at exactly cap bytes incl. NUL, so canonical builds with
+ * -Werror=format-truncation stay quiet. */
+static void tnt_maint_badvar(char *dst, size_t cap, const char *name, int closed)
+{
+	int prec;
+
+	if (!dst)
+		return;
+	if (cap < 5) {
+		if (cap)
+			dst[0] = '\0';
+		return;
+	}
+	prec = (int)cap - (closed ? 4 : 3);		/* "${" + ("}"?) + NUL */
+	snprintf(dst, cap, closed ? "${%.*s}" : "${%.*s", prec, name);
+}
+
+static int tnt_maint_expand(const char *src, char *out, size_t cap,
+							time_t now, char *badvar, size_t badvar_cap)
+{
+	size_t i = 0, o = 0, n = strlen(src);
+	int in_str = 0;
+
+	if (badvar && badvar_cap)
+		badvar[0] = '\0';
+
+	while (i < n) {
+		char c = src[i];
+
+		if (in_str) {
+			if (o + 1 >= cap)
+				goto trunc;
+			out[o++] = c;
+			if (c == '\'') {
+				if (i + 1 < n && src[i + 1] == '\'') {
+					if (o + 1 >= cap)
+						goto trunc;
+					out[o++] = src[++i];
+				} else {
+					in_str = 0;
+				}
+			}
+			i++;
+			continue;
+		}
+
+		if (c == '\'') {
+			in_str = 1;
+			if (o + 1 >= cap)
+				goto trunc;
+			out[o++] = c;
+			i++;
+			continue;
+		}
+
+		if (c == '$' && i + 1 < n && src[i + 1] == '{') {
+			char name[128];
+			char tbuf[128];
+			const char *val;
+			size_t e = i + 2, nl = 0;
+
+			while (e < n && src[e] != '}' && nl + 1 < sizeof(name))
+				name[nl++] = src[e++];
+			name[nl] = '\0';
+			if (e >= n) {
+				if (badvar && badvar_cap)
+					tnt_maint_badvar(badvar, badvar_cap, name, 0);
+				return -1;
+			}
+
+			if (!strcmp(name, "now") || !strcmp(name, "epoch")) {
+				snprintf(tbuf, sizeof(tbuf), "%ld", (long) now);
+				val = tbuf;
+			} else if (!strcmp(name, "hostname") || !strcmp(name, "switchname")) {
+				val = switch_core_get_switchname();
+			} else if (!strncmp(name, "strftime(", 9) && nl > 10 &&
+					   name[nl - 1] == ')') {
+				char fmt[64];
+				switch_time_exp_t tm;
+				switch_size_t retsize = 0;
+
+				snprintf(fmt, sizeof(fmt), "%.*s", (int)(nl - 10), name + 9);
+				switch_time_exp_lt(&tm, switch_time_now());
+				if (switch_strftime_nocheck(tbuf, &retsize, sizeof(tbuf), fmt, &tm)
+					!= SWITCH_STATUS_SUCCESS) {
+					if (badvar && badvar_cap)
+						tnt_maint_badvar(badvar, badvar_cap, name, 1);
+					return -1;
+				}
+				val = tbuf;
+			} else {
+				if (badvar && badvar_cap)
+					tnt_maint_badvar(badvar, badvar_cap, name, 1);
+				return -1;
+			}
+
+			{
+				size_t vl = strlen(val);
+
+				if (o + vl + 1 > cap)
+					goto trunc;
+				memcpy(out + o, val, vl);
+				o += vl;
+			}
+			i = e + 1;
+			continue;
+		}
+
+		if (o + 1 >= cap)
+			goto trunc;
+		out[o++] = c;
+		i++;
+	}
+
+	if (o + 1 >= cap)
+		goto trunc;
+	out[o] = '\0';
+	return 0;
+
+trunc:
+	if (cap)
+		out[cap - 1] = '\0';
+	if (badvar && badvar_cap)
+		snprintf(badvar, badvar_cap, "(output truncated)");
+	return -1;
+}
+
 static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 {
 	switch_xml_t sec, param;
@@ -481,6 +734,18 @@ static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 			static const char *const a[] = { "name", NULL };
 
 			tnt_warn_unknown_attrs(view, a, "views/view");
+			/* dynamic placeholders make no sense in a VIEW body (they would
+			 * freeze at load time) — reject them with the token shown */
+			if (nm && body) {
+				char ph[64];
+
+				if (first_placeholder(body, ph, sizeof(ph))) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  "mod_tarantool: <views> '%s': placeholder '%s' is not "
+									  "allowed in view bodies, view NOT applied\n", nm, ph);
+					continue;
+				}
+			}
 			/* a view body substitutes a whole VIEW: it must be ONE valid
 			 * SELECT — reject garbage / composite SQL with a console warning */
 			if (nm && body && tnt_sql_validate(body, 1, vreason, sizeof(vreason))) {
@@ -647,13 +912,29 @@ static void parse_maintenance(switch_xml_t cfg, tnt_global_t *g)
 			continue;
 		}
 		{
+			char sample[TNT_MAINT_SQL_LEN];
+			char badvar[128];
 			char mreason[128];
+			time_t tnow = switch_epoch_time_now(NULL);
 
-			if (tnt_sql_validate(body, 0, mreason, sizeof(mreason))) {
+			/* expand dynamic variables with a sample time: an unknown ${...}
+			 * (or a strftime error) makes the SQL unusable — the offending
+			 * token and the SQL line are reported to the console */
+			if (tnt_maint_expand(body, sample, sizeof(sample), tnow,
+								 badvar, sizeof(badvar)) != 0) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 								  "mod_tarantool: <maintenance> <sql> (profile '%s'): "
-								  "invalid SQL, entry NOT applied: %s\n",
-								  pr, mreason);
+								  "invalid SQL, entry NOT applied: unknown maintenance "
+								  "variable '%s'\n  sql: %.1024s\n",
+								  pr, badvar, body);
+				skipped++;
+				continue;
+			}
+			if (tnt_sql_validate(sample, 0, mreason, sizeof(mreason))) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <maintenance> <sql> (profile '%s'): "
+								  "invalid SQL, entry NOT applied: %s\n  sql: %.1024s\n",
+								  pr, mreason, body);
 				skipped++;
 				continue;
 			}
@@ -701,6 +982,10 @@ static switch_status_t parse_config(switch_xml_t cfg, tnt_global_t *g)
 	g->ping_idle_ms = 30000;
 	g->ping_timeout_ms = 3000;
 	g->reconnect_ms = 5000;
+	g->cache_cfg = 1;			/* translate cache enabled by default */
+	g->cb_mode = CB_MODE_OFF;	/* circuit breaker disabled by default */
+	g->cb_failure_threshold = CB_FAIL_THRESHOLD_DEFAULT;
+	g->cb_timeout_ms = CB_TIMEOUT_MS_DEFAULT;
 
 	settings = switch_xml_child(cfg, "settings");
 	if (settings) {
@@ -727,6 +1012,26 @@ static switch_status_t parse_config(switch_xml_t cfg, tnt_global_t *g)
 				g->reconnect_ms = parse_ms(value, g->reconnect_ms);
 			} else if (!strcasecmp(name, "debug")) {
 				g->debug = parse_bool_attr(value, 0);
+			} else if (!strcasecmp(name, "cache")) {
+				/* translate-cache kill switch ("if in doubt, turn it
+				 * off"); applied hot on reload as well */
+				g->cache_cfg = parse_bool_attr(value, 1);
+			} else if (!strcasecmp(name, "cb-mode")) {
+				/* shared circuit breaker: off | wait | fast */
+				if (!strcasecmp(value, "off"))
+					g->cb_mode = CB_MODE_OFF;
+				else if (!strcasecmp(value, "wait"))
+					g->cb_mode = CB_MODE_WAIT;
+				else if (!strcasecmp(value, "fast"))
+					g->cb_mode = CB_MODE_FAST;
+				else
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  "mod_tarantool: unknown cb-mode '%s' "
+									  "(off|wait|fast), using off\n", value);
+			} else if (!strcasecmp(name, "cb-failure-threshold")) {
+				g->cb_failure_threshold = atoi(value);
+			} else if (!strcasecmp(name, "cb-timeout")) {
+				g->cb_timeout_ms = parse_ms(value, CB_TIMEOUT_MS_DEFAULT);
 			}
 		}
 	}
@@ -871,7 +1176,6 @@ static switch_status_t config_load(void)
 {
 	switch_xml_t cfg = NULL;
 	tnt_global_t *ng;
-	int hi;
 
 	tnt_cfg_view_fatal = 0;		/* re-arm for every parse attempt */
 	if (!(cfg = tnt_cfg_open()))
@@ -900,30 +1204,35 @@ static switch_status_t config_load(void)
 	glob->ping_timeout_ms = ng->ping_timeout_ms;
 	glob->reconnect_ms = ng->reconnect_ms;
 	glob->debug = ng->debug;
+	glob->cache_cfg = ng->cache_cfg;
+	glob->cb_mode = ng->cb_mode;
+	glob->cb_failure_threshold = ng->cb_failure_threshold;
+	glob->cb_timeout_ms = ng->cb_timeout_ms;
 	snprintf(glob->uuid_default_32, sizeof(glob->uuid_default_32), "%s",
 			 ng->uuid_default_32[0] ? ng->uuid_default_32 : "uuid7()");
 	snprintf(glob->uuid_default_210, sizeof(glob->uuid_default_210), "%s",
 			 ng->uuid_default_210[0] ? ng->uuid_default_210 : "uuid()");
 
-	/* hot-reload: push the new rules snapshot into every ACTIVE connection.
-	 * All rule sections (reserved/views/primaryKey/intColumns/...) live in a
-	 * single tnt_rules_t, so one struct copy applies them wholesale; each
-	 * handle refreshes under its own lock, therefore an in-flight SQL call
-	 * (which holds that lock for its whole batch) is never torn by the swap.
-	 * New connections get the fresh rules at handle_new anyway. */
-	for (hi = 0; hi < glob->nhandles; hi++) {
-		tnt_handle_t *hh = glob->handles[hi];
-
-		if (!hh)
-			continue;
-		if (hh->lock)
-			switch_mutex_lock(hh->lock);
-		hh->rules = glob->rules;
-		tnt_rules_set_uuid_default(&hh->rules, &hh->profile);
-		if (hh->lock)
-			switch_mutex_unlock(hh->lock);
-	}
+	/* hot-reload: rules now propagate LAZILY. Every handle keeps its
+	 * rules_epoch; the first SQL call that sees a stale epoch refreshes
+	 * itself (tnt_handle_rules_refresh), so there is no O(N) walk with a
+	 * lock round-trip per handle on the reload path, and no registry limit
+	 * can make a connection miss the new rules. */
+	glob->rules_epoch++;
 	switch_mutex_unlock(glob->mutex);
+
+	/* circuit breaker: push the <settings> parameters into the shared
+	 * per-host registry (hot on reload; state/counters are NOT reset) */
+	tnt_cb_configure((cb_mode_t)glob->cb_mode, glob->cb_failure_threshold,
+					 glob->cb_timeout_ms);
+
+	/* translate cache: new epoch invalidates every entry; the config value
+	 * also re-arms the runtime switch */
+	switch_mutex_lock(glob->cache_mutex);
+	tnt_tcache_invalidate(&glob->tcache);
+	glob->tcache.enabled = glob->cache_cfg;
+	switch_mutex_unlock(glob->cache_mutex);
+
 	free(ng);
 
 	/* wake the <maintenance> thread so enable/interval/<sql> changes take
@@ -932,9 +1241,9 @@ static switch_status_t config_load(void)
 
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
 					  "mod_tarantool: loaded %d profile(s), %d pk, %d pkadd, %d field rules, "
-					  "rules hot-applied to %d active connection(s)\n",
+					  "rules epoch -> %u (handles refresh lazily), cache %s\n",
 					  glob->nprofiles, glob->rules.npk, glob->rules.npkadd, glob->rules.nfields,
-					  glob->nhandles);
+					  glob->rules_epoch, glob->cache_cfg ? "enabled" : "disabled");
 	return SWITCH_STATUS_SUCCESS;
 }
 
@@ -975,12 +1284,12 @@ static void tnt_debug_log(const char *profile_name, const char *kind,
 		sql = "";
 	n = strlen(sql);
 	if (n > 1024) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
 						  "mod_tarantool [DEBUG]: profile=%s %s %s:%d %s\n  sql: %.*s... (%u bytes total)\n",
 						  profile_name, kind, file ? file : "?", line, func ? func : "?",
 						  (int)1024, sql, (unsigned)n);
 	} else {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
 						  "mod_tarantool [DEBUG]: profile=%s %s %s:%d %s\n  sql: %s\n",
 						  profile_name, kind, file ? file : "?", line, func ? func : "?", sql);
 	}
@@ -1038,6 +1347,7 @@ static switch_status_t tnt_handle_new(switch_cache_db_database_interface_options
 	tnt_handle_t *h;
 	const char *pname = opts.connection_string;
 	tnt_profile_cfg_t *prof;
+	int i;
 
 	if (!dih)
 		return SWITCH_STATUS_FALSE;
@@ -1062,9 +1372,18 @@ static switch_status_t tnt_handle_new(switch_cache_db_database_interface_options
 		return SWITCH_STATUS_FALSE;
 	}
 	h->profile = *prof;
-	h->rules = glob->rules;
+	/* immutable rules snapshot: the exec path reads it without any lock,
+	 * reloads atomically swap in a fresh copy and retire the old one */
+	h->rules = (tnt_rules_t *)malloc(sizeof(*h->rules));
+	if (!h->rules) {
+		switch_mutex_unlock(glob->mutex);
+		free(h);
+		return SWITCH_STATUS_FALSE;
+	}
+	*h->rules = glob->rules;
+	h->rules_epoch = glob->rules_epoch;
 	/* pick the UUID default per the active host's version branch */
-	tnt_rules_set_uuid_default(&h->rules, &h->profile);
+	tnt_rules_set_uuid_default(h->rules, &h->profile);
 	/* propagate timeouts */
 	if (!h->profile.ping_idle_s)
 		h->profile.ping_idle_s = glob->ping_idle_ms / 1000;
@@ -1072,54 +1391,149 @@ static switch_status_t tnt_handle_new(switch_cache_db_database_interface_options
 		h->profile.ping_timeout_s = glob->ping_timeout_ms / 1000;
 	switch_mutex_unlock(glob->mutex);
 
-	tnt_session_init(&h->session, &h->profile);
-	if (tnt_session_open(&h->session) < 0) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-						  "mod_tarantool: cannot connect to profile '%s' (%s)\n",
-						  pname, tnt_conn_last_error(&h->session.conn));
-		free(h);
-		return SWITCH_STATUS_FALSE;
+	/* pool size: config value clamped to [1, TNT_POOL_MAX] */
+	h->pool_size = h->profile.pool_size;
+	if (h->pool_size < 1)
+		h->pool_size = 1;
+	if (h->pool_size > TNT_POOL_MAX)
+		h->pool_size = TNT_POOL_MAX;
+
+	/* open the pool: at least the first connection must succeed; a later
+	 * failure only shrinks the pool (the handle stays usable) */
+	for (i = 0; i < h->pool_size; i++) {
+		tnt_session_init(&h->sessions[i], &h->profile);
+		if (tnt_session_open(&h->sessions[i]) < 0) {
+			if (i == 0) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+								  "mod_tarantool: cannot connect to profile '%s' (%s)\n",
+								  pname, tnt_conn_last_error(&h->sessions[0].conn));
+				free(h->rules);
+				free(h);
+				return SWITCH_STATUS_FALSE;
+			}
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "mod_tarantool: profile '%s': connection %d/%d failed (%s) - pool shrunk to %d\n",
+							  pname, i + 1, h->pool_size,
+							  tnt_conn_last_error(&h->sessions[i].conn), i);
+			break;
+		}
 	}
+	h->pool_size = i;
 	h->created_mono = switch_micro_time_now() / 1000;
 
-	/* per-handle lock: serializes SQL calls against the reload rules swap
-	 * (hot-reload refreshes h->rules under this lock). */
+	/* per-handle lock: SHORT critical sections only (session pick, tx
+	 * pinning, first-callsite recording, CLI access). SQL execution is
+	 * serialized by the per-connection locks below, so pool_size>1 runs
+	 * statements in parallel. */
 	if (glob && glob->pool &&
 		switch_mutex_init(&h->lock, SWITCH_MUTEX_NESTED, glob->pool) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
 						  "mod_tarantool: cannot init handle mutex for profile '%s'\n", pname);
-		tnt_session_close(&h->session);
+		for (i = 0; i < h->pool_size; i++)
+			tnt_session_close(&h->sessions[i]);
+		free(h->rules);
 		free(h);
 		return SWITCH_STATUS_FALSE;
 	}
 
+	/* per-connection mutexes: created once, survive reconnects (the conn
+	 * object itself is memset by tnt_conn_init on every reconnect) */
+	for (i = 0; i < h->pool_size; i++) {
+		if (glob && glob->pool &&
+			switch_mutex_init(&h->conn_locks[i], SWITCH_MUTEX_NESTED, glob->pool) != SWITCH_STATUS_SUCCESS) {
+			int j;
+
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+							  "mod_tarantool: cannot init connection mutex for profile '%s'\n", pname);
+			for (j = 0; j < i; j++)
+				switch_mutex_destroy(h->conn_locks[j]);
+			for (j = 0; j < h->pool_size; j++)
+				tnt_session_close(&h->sessions[j]);
+			switch_mutex_destroy(h->lock);
+			free(h->rules);
+			free(h);
+			return SWITCH_STATUS_FALSE;
+		}
+	}
+
 	*dih = (switch_database_interface_handle_t *)calloc(1, sizeof(**dih));
 	if (!*dih) {
-		if (h->lock)
-			switch_mutex_destroy(h->lock);
-		tnt_session_close(&h->session);
+		for (i = 0; i < h->pool_size; i++) {
+			switch_mutex_destroy(h->conn_locks[i]);
+			tnt_session_close(&h->sessions[i]);
+		}
+		switch_mutex_destroy(h->lock);
+		free(h->rules);
 		free(h);
 		return SWITCH_STATUS_FALSE;
 	}
 	(*dih)->handle = h;
 	tnt_handle_register(h);
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-					  "mod_tarantool: new connection to profile '%s'\n", pname);
+					  "mod_tarantool: new connection to profile '%s' (pool-size %d)\n", pname, h->pool_size);
 	return SWITCH_STATUS_SUCCESS;
+}
+
+/* Retire an immutable rules snapshot (glob->mutex must be held). The
+ * snapshot may still be read by in-flight statements, so it is freed only
+ * after a grace period; reloads are rare (manual), so the list is almost
+ * always empty. */
+static void tnt_rules_snap_retire_locked(tnt_rules_t *old)
+{
+	int64_t now = switch_micro_time_now() / 1000;
+	int i;
+
+	if (!old)
+		return;
+	/* drop snapshots past the grace period */
+	for (i = 0; i < glob->nrules_retired; ) {
+		if (now - glob->rules_retired[i].retired_mono >= TNT_RULES_RETIRE_MS) {
+			free(glob->rules_retired[i].rules);
+			glob->rules_retired[i] = glob->rules_retired[--glob->nrules_retired];
+		} else {
+			i++;
+		}
+	}
+	if (glob->nrules_retired < TNT_RULES_RETIRED_MAX) {
+		glob->rules_retired[glob->nrules_retired].rules = old;
+		glob->rules_retired[glob->nrules_retired].retired_mono = now;
+		glob->nrules_retired++;
+	} else {
+		/* list full: reloads are happening faster than the grace period -
+		 * leaking one 40 KB snapshot is safer than a use-after-free */
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "mod_tarantool: rules retire list full - leaking a snapshot\n");
+	}
+}
+
+static void tnt_rules_snap_retire(tnt_rules_t *old)
+{
+	switch_mutex_lock(glob->mutex);
+	tnt_rules_snap_retire_locked(old);
+	switch_mutex_unlock(glob->mutex);
 }
 
 static switch_status_t tnt_handle_destroy(switch_database_interface_handle_t **dih)
 {
 	tnt_handle_t *h;
+	int i;
 
 	if (!dih || !*dih)
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)(*dih)->handle;
 	if (h) {
 		tnt_handle_unregister(h);
-		tnt_session_close(&h->session);
+		for (i = 0; i < h->pool_size; i++) {
+			if (h->conn_locks[i])
+				switch_mutex_destroy(h->conn_locks[i]);
+			tnt_session_close(&h->sessions[i]);
+		}
 		if (h->lock)
 			switch_mutex_destroy(h->lock);
+		/* the snapshot may still be read by an in-flight statement: retire
+		 * it through the grace list instead of freeing it right away */
+		if (h->rules)
+			tnt_rules_snap_retire(h->rules);
 		free(h);
 	}
 	free(*dih);
@@ -1157,6 +1571,221 @@ static int tnt_batch_is_cleanup_ddl(const tnt_stmt_t *stmts, int n)
 	return n > 0;
 }
 
+/* Lazy rules refresh: called from the exec path. The rules swap changes
+ * the TRANSLATED text of every template, so the per-connection prepared
+ * statements (keyed by the translated template hash) are all stale and
+ * are dropped under each connection's lock. */
+static void tnt_handle_rules_refresh(tnt_handle_t *h)
+{
+	int i;
+
+	switch_mutex_lock(glob->mutex);
+	if (h->rules_epoch != glob->rules_epoch) {
+		tnt_rules_t *nr = (tnt_rules_t *)malloc(sizeof(*nr));
+
+		if (nr) {
+			*nr = glob->rules;
+			tnt_rules_set_uuid_default(nr, &h->profile);
+			tnt_rules_snap_retire_locked(h->rules);
+			__atomic_store_n(&h->rules, nr, __ATOMIC_RELEASE);
+			h->rules_epoch = glob->rules_epoch;
+		}
+	}
+	switch_mutex_unlock(glob->mutex);
+	for (i = 0; i < h->pool_size; i++) {
+		if (h->conn_locks[i])
+			switch_mutex_lock(h->conn_locks[i]);
+		tnt_conn_prep_reset(&h->sessions[i].conn);
+		if (h->conn_locks[i])
+			switch_mutex_unlock(h->conn_locks[i]);
+	}
+}
+
+/* FNV-1a 64 over a NUL-terminated string - the translate-cache key
+ * (the key is the INPUT TEMPLATE, not the raw text). */
+static uint64_t tnt_str_hash(const char *s)
+{
+	uint64_t hsh = 1469598103934665603ULL;
+
+	while (*s) {
+		hsh ^= (uint8_t)*s++;
+		hsh *= 1099511628211ULL;
+	}
+	return hsh;
+}
+
+/* Pick the connection for the next statement: the pinned one while a
+ * transaction is in progress (all statements of the transaction MUST hit
+ * the same connection), otherwise round-robin. The pinned connection is
+ * skipped by other callers when pool_size > 1. Short h->lock hold. */
+static tnt_session_t *pick_session(tnt_handle_t *h, int *idx)
+{
+	tnt_session_t *s;
+	int i, k;
+
+	switch_mutex_lock(h->lock);
+	if (h->tx_pinned && h->pool_size > 1) {
+		for (i = 0; i < h->pool_size; i++) {
+			k = (h->rr + i) % h->pool_size;
+			if (k == h->tx_idx)
+				continue;
+			h->rr = (k + 1) % h->pool_size;
+			*idx = k;
+			s = &h->sessions[k];
+			switch_mutex_unlock(h->lock);
+			return s;
+		}
+	}
+	if (h->tx_pinned) {
+		/* pool_size == 1: the transaction owns the only connection */
+		*idx = h->tx_idx;
+		s = &h->sessions[h->tx_idx];
+	} else {
+		*idx = h->rr;
+		h->rr = (h->rr + 1) % h->pool_size;
+		s = &h->sessions[*idx];
+	}
+	switch_mutex_unlock(h->lock);
+	return s;
+}
+
+/* Attempt a prepared-statement execution of a translated TEMPLATE (marker
+	* bytes, stage 2). Keyed per connection by the template hash; the bind
+	* values come from templateize of THIS call. Falls back to the plain path
+	* on every error path, so the caller never loses correctness:
+	*   0 = executed via a prepared statement (*res is filled);
+	*   1 = fall back (*out receives the rebuilt concrete SQL, or NULL on OOM).
+	* Transport failures also return 1: tnt_session_execute restores the
+	* session (prep[] dies with the connection via tnt_conn_init/close).
+	* The caller holds s's connection lock. */
+static int tnt_try_prepared(tnt_handle_t *h, tnt_session_t *s, const char *tpl_tr,
+							const tnt_sql_val_t *vals, int nvals,
+							tnt_result_t *res, char **out)
+{
+	tnt_conn_t *cn = &s->conn;
+	uint64_t phsh = tnt_str_hash(tpl_tr);
+	uint8_t *bind = NULL;
+	size_t blen = 0;
+	char *qsql = NULL;
+	uint32_t sid = 0;
+	int prc = -1;
+	const char *why = NULL;		/* fallback reason (diagnostics) */
+	const char *why_detail = NULL;
+
+	*out = NULL;
+	/* prepare_supported comes from the REAL server version in the greeting
+	 * (box.prepare appeared in 2.11); prepare_allowed is the per-host
+	 * config flag possibly overridden at runtime by 'tarantool prepare' */
+	if (cn->fd < 0 || cn->prepare_broken ||
+		!cn->prepare_allowed || !cn->prepare_supported) {
+		why = cn->fd < 0 ? "no-connection" :
+			  cn->prepare_broken ? "prepare-broken" :
+			  !cn->prepare_allowed ? "prepare-disabled" :
+			  "prepare-unsupported";
+		goto fallback;
+	}
+
+	/* template -> '?'-parameter SQL (strictly 1:1 byte substitution) */
+	qsql = (char *)malloc(strlen(tpl_tr) + 1);
+	if (!qsql || tnt_sql_tpl_qmarks(tpl_tr, qsql, strlen(tpl_tr) + 1) < 0) {
+		why = "oom:qsql";
+		goto fallback;
+	}
+
+	if (nvals > 0) {
+		size_t bcap = (size_t)nvals * (TNT_SQL_VAL_MAX + 8) + 16;
+
+		bind = (uint8_t *)malloc(bcap);
+		if (!bind || tnt_bind_encode(vals, nvals, bind, bcap, &blen) < 0) {
+			why = "oom:bind";
+			goto fallback;
+		}
+	}
+
+	if (tnt_conn_prep_lookup(cn, phsh, &sid)) {
+		switch_mutex_lock(glob->cache_mutex);
+		glob->p_phits++;
+		switch_mutex_unlock(glob->cache_mutex);
+		prc = tnt_session_exec_prepared(s, sid, bind, blen, res);
+	} else {
+		prc = tnt_conn_prepare(cn, qsql, &sid);
+		if (prc == 0) {
+			cn->prep_fail_run = 0;
+			switch_mutex_lock(glob->cache_mutex);
+			glob->p_prepares++;
+			switch_mutex_unlock(glob->cache_mutex);
+			tnt_conn_prep_insert(cn, phsh, sid);
+			prc = tnt_session_exec_prepared(s, sid, bind, blen, res);
+		} else if (prc > 0) {
+			/* the server refused to prepare this statement */
+			switch_mutex_lock(glob->cache_mutex);
+			glob->p_errors++;
+			switch_mutex_unlock(glob->cache_mutex);
+			why = "prepare-rejected";
+			why_detail = cn->error;
+			if (++cn->prep_fail_run >= 16) {
+				/* old generation / PREPARE unusable on this conn: stop trying */
+				cn->prepare_broken = 1;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: PREPARE keeps failing (%s) - disabled for this connection\n",
+								  cn->error);
+			}
+		}
+	}
+
+	if (prc == 0) {
+		switch_mutex_lock(glob->cache_mutex);
+		glob->p_execs++;
+		switch_mutex_unlock(glob->cache_mutex);
+		free(qsql);
+		free(bind);
+		return 0;
+	}
+	if (prc > 0) {
+		/* SQL error on EXECUTE (e.g. the prepared statement was
+		 * invalidated by a schema change): drop it and surface the error
+		 * through the plain path */
+		why = "sql-error";
+		why_detail = res->error;
+		tnt_conn_prep_drop(cn, phsh);
+	} else {
+		/* transport failure: the connection is dying, its stmt_ids too */
+		why = "transport";
+		tnt_conn_prep_reset(cn);
+	}
+
+fallback:
+	switch_mutex_lock(glob->cache_mutex);
+	glob->p_fallbacks++;
+	switch_mutex_unlock(glob->cache_mutex);
+	/* diagnostics under 'tarantool debug on': which statement fell back
+		* and why (schema-change invalidation shows as sql-error) */
+	if (tnt_debug_active(h->profile_name)) {
+		char qb[1024];
+
+		if (tnt_sql_tpl_qmarks(tpl_tr, qb, sizeof(qb)) < 0)
+			snprintf(qb, sizeof(qb), "%.*s", (int)sizeof(qb) - 1, tpl_tr);
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+						  "mod_tarantool: prepare fallback (%s%s%s): [%s]\n",
+						  why ? why : "unknown",
+						  why_detail && why_detail[0] ? ": " : "",
+						  why_detail && why_detail[0] ? why_detail : "",
+						  qb);
+	}
+	free(qsql);
+	free(bind);
+	{
+		size_t rcap = strlen(tpl_tr) * 2 + 64;
+
+		*out = (char *)malloc(rcap);
+		if (!*out || tnt_sql_rebuild(tpl_tr, vals, nvals, *out, rcap) != 0) {
+			free(*out);
+			*out = NULL;
+		}
+	}
+	return 1;
+}
+
 /* Execute a list of already-split statements, each via its own
  * IPROTO_EXECUTE. Tarantool SQL does NOT support multiple statements in a
  * single execute, yet mod_sofia REQUIRES batch support (it probes with
@@ -1174,20 +1803,57 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 	int i, r;
 	int any_ran = 0;
 	int cleanup_ddl;
+	tnt_rules_t *rules;
 	switch_status_t status = SWITCH_STATUS_SUCCESS;
 
 	memset(res, 0, sizeof(*res));
 	cleanup_ddl = tnt_batch_is_cleanup_ddl(stmts, n);
 
+	/* lazy rules refresh: the epoch check is a plain read; the immutable
+	 * snapshot swap happens under glob->mutex at most once per handle per
+	 * reload. The exec path reads the snapshot WITHOUT any lock, so
+	 * statements on different connections translate in parallel. */
+	if (glob && glob->rules_epoch != h->rules_epoch)
+		tnt_handle_rules_refresh(h);
+	rules = glob ? __atomic_load_n(&h->rules, __ATOMIC_ACQUIRE) : NULL;
+
+	/* runtime SQL statistics (accounting BEFORE translation: it measures
+	 * the incoming workload, not the rewritten statements). The enabled
+	 * flag is read without the lock on purpose - this is a diagnostics
+	 * path, and the mutex below keeps mutations vs accounting consistent. */
+	if (glob && glob->stats.enabled) {
+		switch_mutex_lock(glob->stats_mutex);
+		tnt_stats_record(&glob->stats, stmts, n);
+		switch_mutex_unlock(glob->stats_mutex);
+	}
+
 	for (i = 0; i < n; i++) {
-		char *out;
+		tnt_session_t *s;
+		int sidx;
+		char *out = NULL;
 		int noop = 0;
 		int rc;
 		int stmt_retryable;
 		tnt_translate_ctx_t ctx;
 		char uuidbuf[40];
+		/* prepared-statement state (stage 2): lives past the translate
+		 * block because the bind values are needed at execute time */
+		tnt_sql_val_t *vals = NULL;
+		int nvals = 0;
+		char *tpl_tr = NULL;	/* translated template with marker bytes */
+		int use_prep = 0;
+		int tpl_literal = 0;	/* SELECT list carries literals to materialize */
 
 		stmt_retryable = (stmts[i].type == TNT_STMT_SELECT || stmts[i].type == TNT_STMT_BEGIN) ? 1 : 0;
+
+		/* pick the connection (round-robin; the pinned one while a
+		 * transaction is in progress) and hold ITS lock for the whole
+		 * statement: with pool_size>1 statements on different connections
+		 * run in parallel, pool_size=1 reproduces the classic
+		 * serialization. All exits from the loop body go through the
+		 * stmt_cont/stmt_done labels below to release the lock. */
+		s = pick_session(h, &sidx);
+		switch_mutex_lock(h->conn_locks[sidx]);
 
 		/* skip-index=true: never run CREATE INDEX — indexes are managed
 		 * manually (e.g. composite ones for JOINs). */
@@ -1195,7 +1861,7 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 							  "mod_tarantool: skipping CREATE INDEX (skip-index=true): [%.*s]\n",
 							  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
-			continue;
+			goto stmt_cont;
 		}
 
 		/* per-statement translation context: fresh core UUIDv7 + global
@@ -1204,50 +1870,308 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 		if (tnt_uuidv7(uuidbuf) == 0)
 			ctx.core_uuid = uuidbuf;
 		ctx.resolver = tnt_resolve_global;
-		out = tnt_rules_translate(&h->rules, &stmts[i],
-								  !strncmp(h->profile.hosts[0].version, "3.", 2) ? 3 : 2,
-								  &ctx, &noop);
-		if (noop) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-							  "mod_tarantool: skipping statement (no-op): [%.*s]\n",
-							  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
-			continue;
-		}
-		if (!out) {
-			if (err)
-				*err = strdup("mod_tarantool: out of memory translating statement");
-			status = SWITCH_STATUS_FALSE;
-			goto done;
-		}
 
-		/* Quote Tarantool-reserved identifiers ('uuid', 'alias') in this
-		 * statement before it hits the server. Worst case is a doubling of
-		 * the size, so allocate strlen*2 + slack. */
+		/* translate cache: the key is the INPUT TEMPLATE (data literals
+		 * replaced by marker bytes, text lowercased/whitespace-collapsed),
+		 * so every shape of the same statement shares one entry. The cache
+		 * stores the translated+quoted TEMPLATE; on a hit the caller's own
+		 * literals are rebuilt into it. Statements whose rewrite depends on
+		 * the literal values (intColumns cast, core-UUID injection,
+		 * $${var}) set ctx.ctx_dep and fall back to the raw path. */
 		{
-			size_t ncap = strlen(out) * 2 + 64;
+			int ver = !strncmp(h->profile.hosts[0].version, "3.", 2) ? 3 : 2;
+			uint64_t hsh = 0;
+			char *tpl_in = NULL;	/* input template (marker bytes) */
+			/* cacheable/preparable statements: DML/SELECT only.
+			 * - cache: startup DDL (CREATE/DROP/ALTER, ~70+ one-shot
+			 *   shapes) would sit in the cache forever with hits=1 -
+			 *   dead ballast that pollutes 'cache show' and hit-rate;
+			 * - prepare (stage 2): box.prepare rejects DDL/PRAGMA.
+			 * The prepare flag itself is per-HOST (<param name="prepare"/>
+			 * in <profile>/<host>, inherited profile -> host), resolved
+			 * against the REAL server version from the greeting in
+			 * tnt_conn_init/conn_read_greeting. */
+			int cacheable = (stmts[i].type == TNT_STMT_SELECT ||
+							 stmts[i].type == TNT_STMT_INSERT ||
+							 stmts[i].type == TNT_STMT_UPDATE ||
+							 stmts[i].type == TNT_STMT_DELETE);
+			int prepable = cacheable && s->conn.prepare_allowed;
 			const char *words[TNT_RESERVED_MAX];
-			int nwords = tnt_reserved_ptr_list(&h->rules, words, TNT_RESERVED_MAX);
-			char *nb = (char *)malloc(ncap);
+			int nwords = tnt_reserved_ptr_list(rules, words, TNT_RESERVED_MAX);
 
-			if (!nb) {
-				free(out);
-				if (err && *err == NULL)
-					*err = strdup("mod_tarantool: out of memory quoting statement");
-				status = SWITCH_STATUS_FALSE;
-				goto done;
+			if (glob && cacheable && (glob->tcache.enabled || prepable)) {
+				size_t slen = stmts[i].end - stmts[i].start;
+
+				tpl_in = (char *)malloc(slen + 1);
+				vals = (tnt_sql_val_t *)malloc(sizeof(tnt_sql_val_t) * TNT_SQL_VALS_MAX);
+				if (tpl_in && vals &&
+					tnt_sql_templateize(stmts[i].sql, stmts[i].start, stmts[i].end,
+										tpl_in, slen + 1, vals, TNT_SQL_VALS_MAX,
+										&nvals) == 0) {
+					const char *tpl;
+					int cnoop = 0;
+					int clit = 0;
+
+					hsh = tnt_str_hash(tpl_in);
+					switch_mutex_lock(glob->cache_mutex);
+					tpl = tnt_tcache_fetch(&glob->tcache, hsh, &cnoop, &clit);
+					if (tpl) {
+						/* the borrowed template is only valid while we
+						 * hold the lock: copy it for the prepared path
+						 * (which needs the translated template, not the
+						 * rebuilt text) */
+						if (prepable) {
+							tpl_tr = (char *)malloc(strlen(tpl) + 1);
+							if (tpl_tr) {
+								memcpy(tpl_tr, tpl, strlen(tpl) + 1);
+								noop = cnoop;
+								use_prep = 1;
+								tpl_literal = clit;
+							}
+						}
+						if (!use_prep) {
+							size_t rcap = strlen(tpl) * 2 + 64;
+
+							/* rebuild the concrete statement under the
+							 * cache lock */
+							out = (char *)malloc(rcap);
+							if (out && tnt_sql_rebuild(tpl, vals, nvals, out, rcap) == 0) {
+								noop = cnoop;
+							} else {
+								free(out);
+								out = NULL;		/* marker mismatch: treat as miss */
+							}
+						}
+					}
+					switch_mutex_unlock(glob->cache_mutex);
+				}
 			}
-			tnt_sql_quote_reserved(out, nb, ncap, words, nwords);
-			free(out);
-			out = nb;
+
+			if (noop && (out || use_prep)) {
+				/* cached no-op */
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "mod_tarantool: skipping statement (no-op): [%.*s]\n",
+								  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
+				free(out);
+				free(tpl_tr);
+				free(tpl_in);
+				free(vals);
+				goto stmt_cont;
+			}
+
+			if (!out && !use_prep) {
+				/* miss: translate (on the template, raw fallback on any
+				 * literal dependency), quote, rebuild, store */
+				tnt_stmt_t tst = stmts[i];
+				char *pre;
+
+				if (tpl_in) {
+					tst.sql = tpl_in;
+					tst.start = 0;
+					tst.end = strlen(tpl_in);
+				}
+				pre = tnt_rules_translate(rules, &tst, ver, &ctx, &noop);
+				if (pre && tpl_in && ctx.ctx_dep) {
+					/* the rewrite depends on the literal values (intColumns
+					 * cast etc.): the template result is unusable - go raw */
+					free(pre);
+					pre = tnt_rules_translate(rules, &stmts[i], ver, &ctx, &noop);
+				}
+				if (noop) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									  "mod_tarantool: skipping statement (no-op): [%.*s]\n",
+									  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
+					free(pre);
+					free(tpl_in);
+					free(vals);
+					goto stmt_cont;
+				}
+				if (!pre) {
+					if (err)
+						*err = strdup("mod_tarantool: out of memory translating statement");
+					free(tpl_in);
+					free(vals);
+					status = SWITCH_STATUS_FALSE;
+					goto stmt_done;
+				}
+				/* Quote Tarantool-reserved identifiers; takes ownership of
+				 * 'pre'. Worst case doubles the size. */
+				{
+					size_t ncap = strlen(pre) * 2 + 64;
+					char *nb = (char *)malloc(ncap);
+
+					if (!nb) {
+						free(pre);
+						free(tpl_in);
+						free(vals);
+						if (err && *err == NULL)
+							*err = strdup("mod_tarantool: out of memory quoting statement");
+						status = SWITCH_STATUS_FALSE;
+						goto stmt_done;
+					}
+					tnt_sql_quote_reserved(pre, nb, ncap, words, nwords);
+					free(pre);
+					out = nb;
+				}
+
+				if (tpl_in && !ctx.ctx_dep && prepable) {
+					/* store the translated TEMPLATE and execute via a
+					 * prepared statement (stage 2). The literal flag is
+					 * computed once here: it tells the prepared path that
+					 * the SELECT list carries data literals which must be
+					 * materialized into constants (Tarantool cannot type
+					 * '?' in the SELECT list). */
+					int lit = tnt_sql_has_select_markers(out, strlen(out));
+
+					switch_mutex_lock(glob->cache_mutex);
+					tnt_tcache_store(&glob->tcache, hsh, out, noop, stmts[i].type, lit);
+					switch_mutex_unlock(glob->cache_mutex);
+					tpl_tr = out;
+					out = NULL;
+					use_prep = 1;
+					tpl_literal = lit;
+				} else if (tpl_in && !ctx.ctx_dep) {
+					/* the cache stores the TEMPLATE; rebuild the concrete
+					 * text of THIS call for execution. A marker mismatch
+					 * means an unexpected rewrite happened - fall back to
+					 * the raw translate for correctness and skip storing. */
+					size_t rcap = strlen(out) * 2 + 64;
+					char *fin = (char *)malloc(rcap);
+
+					if (fin && tnt_sql_rebuild(out, vals, nvals, fin, rcap) == 0) {
+						switch_mutex_lock(glob->cache_mutex);
+						tnt_tcache_store(&glob->tcache, hsh, out, noop, stmts[i].type, 0);
+						switch_mutex_unlock(glob->cache_mutex);
+						free(out);
+						out = fin;
+					} else {
+						free(fin);
+						free(out);
+						out = tnt_rules_translate(rules, &stmts[i], ver, &ctx, &noop);
+						if (noop) {
+							switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+											  "mod_tarantool: skipping statement (no-op): [%.*s]\n",
+											  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
+							free(out);
+							free(tpl_in);
+							free(vals);
+							goto stmt_cont;
+						}
+						if (!out) {
+							if (err)
+								*err = strdup("mod_tarantool: out of memory translating statement");
+							free(tpl_in);
+							free(vals);
+							status = SWITCH_STATUS_FALSE;
+							goto stmt_done;
+						}
+						{
+							size_t ncap = strlen(out) * 2 + 64;
+							char *nb = (char *)malloc(ncap);
+
+							if (!nb) {
+								free(out);
+								free(tpl_in);
+								free(vals);
+								if (err && *err == NULL)
+									*err = strdup("mod_tarantool: out of memory quoting statement");
+								status = SWITCH_STATUS_FALSE;
+								goto stmt_done;
+							}
+							tnt_sql_quote_reserved(out, nb, ncap, words, nwords);
+							free(out);
+							out = nb;
+						}
+					}
+				}
+			}
+			free(tpl_in);
+			/* vals are still needed by the prepared path (bind encoding) */
+			if (!use_prep) {
+				free(vals);
+				vals = NULL;
+			}
 		}
 
 		h->n_queries++;
 		if (tnt_debug_active(h->profile_name))
-			tnt_debug_log(h->profile_name, "out", h->caller_file, h->caller_func, h->caller_line, out);
+			tnt_debug_log(h->profile_name, "out", h->caller_file, h->caller_func, h->caller_line,
+						  tpl_tr ? tpl_tr : out);
 
 		/* drop the previous statement's result; *res keeps the LAST one */
 		tnt_result_free(res);
-		rc = tnt_session_execute(&h->session, out, stmt_retryable, res);
+
+		if (use_prep && tpl_tr) {
+			/* stage 2: try the prepared-statement path (per-conn stmt_id
+			 * cache + bind); on any error it falls back and *out receives
+			 * the rebuilt concrete SQL for the plain path */
+			char *fb = NULL;
+
+			if (tpl_literal) {
+				/* the SELECT list carries data literals: materialize them
+				 * into constants (Tarantool cannot type '?' there) and drop
+				 * their values from the bind array. The result is a
+				 * partially materialized template: constants in SELECT,
+				 * marker bytes in WHERE. */
+				size_t mcap = strlen(tpl_tr) * 2 + 64;
+				char *mt = (char *)malloc(mcap);
+
+				if (mt && tnt_sql_materialize_select(tpl_tr, vals, &nvals, mt, mcap) == 0) {
+					free(tpl_tr);
+					tpl_tr = mt;
+				} else {
+					free(mt);
+					/* cannot materialize (OOM): fall back to the plain path */
+					use_prep = 0;
+				}
+			}
+
+			if (use_prep) {
+				rc = tnt_try_prepared(h, s, tpl_tr, vals, nvals, res, &fb);
+				free(tpl_tr);
+				tpl_tr = NULL;
+				free(vals);
+				vals = NULL;
+				if (rc == 0) {
+					h->affected_rows = res->affected_rows >= 0 ? res->affected_rows : 0;
+					if (callback && res->ncols > 0) {
+						for (r = 0; r < res->nrows; r++) {
+							if (callback(pdata, res->ncols, res->rows[r], res->col_name))
+								break;
+						}
+					}
+					any_ran = 1;
+					goto stmt_cont;
+				}
+				if (!fb) {
+					if (err && *err == NULL)
+						*err = strdup("mod_tarantool: out of memory rebuilding statement");
+					status = SWITCH_STATUS_FALSE;
+					goto stmt_done;
+				}
+				out = fb;	/* fall through to the plain execute below */
+			} else {
+				/* materialization failed: rebuild the concrete SQL from the
+				 * original template and run the plain path */
+				size_t rcap = strlen(tpl_tr) * 2 + 64;
+
+				out = (char *)malloc(rcap);
+				if (!out || tnt_sql_rebuild(tpl_tr, vals, nvals, out, rcap) != 0) {
+					free(out);
+					out = NULL;
+					if (err && *err == NULL)
+						*err = strdup("mod_tarantool: out of memory rebuilding statement");
+					status = SWITCH_STATUS_FALSE;
+					goto stmt_done;
+				}
+				free(tpl_tr);
+				tpl_tr = NULL;
+				free(vals);
+				vals = NULL;
+			}
+		}
+
+		rc = tnt_session_execute(s, out, stmt_retryable, res);
 		if (rc == 1) {
 			/* deterministic SQL error: report unless benign */
 			if (cleanup_ddl && tnt_rules_is_benign_error(res->error, 1)) {
@@ -1255,7 +2179,7 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 								  "mod_tarantool: benign error treated as success: [%s]\n", res->error);
 				free(out);
 				any_ran = 1;
-				continue;
+				goto stmt_cont;
 			}
 			/* surface the rejected SQL under 'tarantool debug on' — the core
 			 * (test_reactive) often hides the CREATE failure, leaving a
@@ -1268,13 +2192,13 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 				*err = strdup(res->error[0] ? res->error : "tarantool SQL error");
 			free(out);
 			status = SWITCH_STATUS_FALSE;
-			goto done;
+			goto stmt_done;
 		} else if (rc < 0) {
 			if (err && *err == NULL)
-				*err = strdup(tnt_conn_last_error(&h->session.conn));
+				*err = strdup(tnt_conn_last_error(&s->conn));
 			free(out);
 			status = SWITCH_STATUS_FALSE;
-			goto done;
+			goto stmt_done;
 		} else {
 			h->affected_rows = res->affected_rows >= 0 ? res->affected_rows : 0;
 			if (callback && res->ncols > 0) {
@@ -1286,6 +2210,16 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 		}
 		any_ran = 1;
 		free(out);
+		switch_mutex_unlock(h->conn_locks[sidx]);
+		continue;
+
+	stmt_cont:
+		switch_mutex_unlock(h->conn_locks[sidx]);
+		continue;
+
+	stmt_done:
+		switch_mutex_unlock(h->conn_locks[sidx]);
+		goto done;
 	}
 
 	if (!any_ran)
@@ -1330,22 +2264,21 @@ static switch_status_t tnt_exec_detailed(const char *file, const char *func, int
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
 
-	/* serialize SQL calls vs the reload rules swap (hot-reload) */
-	if (h->lock)
-		switch_mutex_lock(h->lock);
-
-	/* remember the first callsite that uses this connection */
+	/* remember the first callsite that uses this connection (short
+	 * h->lock hold: parallel callers race only on the very first call) */
 	if (!h->caller_set) {
-		snprintf(h->caller_file, sizeof(h->caller_file), "%s", file ? file : "?");
-		snprintf(h->caller_func, sizeof(h->caller_func), "%s", func ? func : "?");
-		h->caller_line = line;
-		h->caller_set = 1;
+		switch_mutex_lock(h->lock);
+		if (!h->caller_set) {
+			snprintf(h->caller_file, sizeof(h->caller_file), "%s", file ? file : "?");
+			snprintf(h->caller_func, sizeof(h->caller_func), "%s", func ? func : "?");
+			h->caller_line = line;
+			h->caller_set = 1;
+		}
+		switch_mutex_unlock(h->lock);
 	}
 
 	st = tnt_exec_sql(h, sql, &res, err);
 	tnt_result_free(&res);
-	if (h->lock)
-		switch_mutex_unlock(h->lock);
 	return st;
 }
 
@@ -1360,16 +2293,16 @@ static switch_status_t tnt_exec_string(switch_database_interface_handle_t *dih,
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
 
-	/* serialize SQL calls vs the reload rules swap (hot-reload) */
-	if (h->lock)
-		switch_mutex_lock(h->lock);
-
 	/* exec_string has no file/func/line; label the caller explicitly */
 	if (!h->caller_set) {
-		snprintf(h->caller_file, sizeof(h->caller_file), "%s", "exec_string");
-		snprintf(h->caller_func, sizeof(h->caller_func), "%s", "exec_string");
-		h->caller_line = 0;
-		h->caller_set = 1;
+		switch_mutex_lock(h->lock);
+		if (!h->caller_set) {
+			snprintf(h->caller_file, sizeof(h->caller_file), "%s", "exec_string");
+			snprintf(h->caller_func, sizeof(h->caller_func), "%s", "exec_string");
+			h->caller_line = 0;
+			h->caller_set = 1;
+		}
+		switch_mutex_unlock(h->lock);
 	}
 
 	st = tnt_exec_sql(h, sql, &res, err);
@@ -1377,8 +2310,6 @@ static switch_status_t tnt_exec_string(switch_database_interface_handle_t *dih,
 		snprintf(resbuf, len, "%s", res.rows[0][0] ? res.rows[0][0] : "");
 	}
 	tnt_result_free(&res);
-	if (h->lock)
-		switch_mutex_unlock(h->lock);
 	return st;
 }
 
@@ -1389,6 +2320,22 @@ static switch_status_t tnt_set_auto_commit(switch_database_interface_handle_t *d
 	if (!dih || !dih->handle)
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
+	if (!on) {
+		/* transaction start: pin the current round-robin connection so
+		 * every statement of the transaction hits the SAME connection
+		 * (other callers skip the pinned one when pool_size > 1) */
+		switch_mutex_lock(h->lock);
+		if (!h->tx_pinned) {
+			h->tx_idx = h->rr;
+			h->rr = (h->rr + 1) % h->pool_size;
+			h->tx_pinned = 1;
+		}
+		switch_mutex_unlock(h->lock);
+	} else {
+		switch_mutex_lock(h->lock);
+		h->tx_pinned = 0;
+		switch_mutex_unlock(h->lock);
+	}
 	h->auto_commit = on;
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -1401,6 +2348,9 @@ static switch_status_t tnt_commit(switch_database_interface_handle_t *dih)
 	if (!dih || !dih->handle)
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
+	switch_mutex_lock(h->lock);
+	h->tx_pinned = 0;
+	switch_mutex_unlock(h->lock);
 	h->auto_commit = SWITCH_TRUE;
 	/* Tarantool is always in autocommit mode for single statements */
 	return SWITCH_STATUS_SUCCESS;
@@ -1413,6 +2363,9 @@ static switch_status_t tnt_rollback(switch_database_interface_handle_t *dih)
 	if (!dih || !dih->handle)
 		return SWITCH_STATUS_FALSE;
 	h = (tnt_handle_t *)dih->handle;
+	switch_mutex_lock(h->lock);
+	h->tx_pinned = 0;
+	switch_mutex_unlock(h->lock);
 	h->auto_commit = SWITCH_TRUE;
 	return SWITCH_STATUS_SUCCESS;
 }
@@ -1445,16 +2398,17 @@ static switch_status_t tnt_callback_exec_detailed(const char *file, const char *
 	h = (tnt_handle_t *)dih->handle;
 	switch_assert(callback != NULL);
 
-	/* serialize SQL calls vs the reload rules swap (hot-reload) */
-	if (h->lock)
-		switch_mutex_lock(h->lock);
-
-	/* remember the first callsite that uses this connection */
+	/* remember the first callsite that uses this connection (short
+	 * h->lock hold: parallel callers race only on the very first call) */
 	if (!h->caller_set) {
-		snprintf(h->caller_file, sizeof(h->caller_file), "%s", file ? file : "?");
-		snprintf(h->caller_func, sizeof(h->caller_func), "%s", func ? func : "?");
-		h->caller_line = line;
-		h->caller_set = 1;
+		switch_mutex_lock(h->lock);
+		if (!h->caller_set) {
+			snprintf(h->caller_file, sizeof(h->caller_file), "%s", file ? file : "?");
+			snprintf(h->caller_func, sizeof(h->caller_func), "%s", func ? func : "?");
+			h->caller_line = line;
+			h->caller_set = 1;
+		}
+		switch_mutex_unlock(h->lock);
 	}
 
 	if (tnt_debug_active(h->profile_name))
@@ -1465,8 +2419,6 @@ static switch_status_t tnt_callback_exec_detailed(const char *file, const char *
 	n = tnt_sql_split(sql, stmts, TNT_SQL_MAX_STMTS);
 	st = tnt_exec_statements(h, stmts, n, callback, pdata, &res, err);
 	tnt_result_free(&res);
-	if (h->lock)
-		switch_mutex_unlock(h->lock);
 	return st;
 }
 
@@ -1481,8 +2433,8 @@ static void api_print_profile(switch_stream_handle_t *stream, const tnt_profile_
 	int i;
 
 	stream->write_function(stream, "Profile: %s\n", p->name);
-	stream->write_function(stream, "  hosts: %d, user: %s, skip-index: %s, full-scan: %s\n",
-						   p->nhosts, p->username, p->skip_index ? "true" : "false",
+	stream->write_function(stream, "  hosts: %d, pool-size: %d, user: %s, skip-index: %s, full-scan: %s\n",
+						   p->nhosts, p->pool_size, p->username, p->skip_index ? "true" : "false",
 						   p->full_scan ? "true" : "false");
 	if (p->init_sql[0])
 		stream->write_function(stream, "  init-sql: %s\n", p->init_sql);
@@ -1589,6 +2541,11 @@ SWITCH_STANDARD_API(api_tarantool)
 		stream->write_function(stream, "  check <profile>   - ping every host in the profile\n");
 		stream->write_function(stream, "  sql <profile> <q> - run a raw query\n");
 		stream->write_function(stream, "  translate <q>     - show translated SQL\n");
+		stream->write_function(stream, "  sqlstats on|off|reset | tables [<t1> ...|all] | show [N] [table]\n");
+		stream->write_function(stream, "                    - runtime SQL template statistics\n");
+		stream->write_function(stream, "  cache on|off|reset | show [N] [full]\n");
+		stream->write_function(stream, "                    - statement translate cache control\n");
+		stream->write_function(stream, "  cb show|reset     - shared circuit breaker state/counters\n");
 		stream->write_function(stream, "  reload            - reload tarantool.conf.xml\n");
 		stream->write_function(stream, "  drop              - release resources (no-op in v1)\n");
 		stream->write_function(stream, "  version           - module version\n");
@@ -1634,6 +2591,258 @@ SWITCH_STANDARD_API(api_tarantool)
 		stream->write_function(stream, "mod_tarantool %s\n", TNT_VERSION);
 	} else if (!strcasecmp(sub, "drop")) {
 		stream->write_function(stream, "drop: no-op in v1\n");
+	} else if (!strcasecmp(sub, "sqlstats")) {
+		const char *what = argc > 1 ? argv[1] : NULL;
+
+		if (!what || !strcasecmp(what, "show")) {
+			/* tarantool sqlstats show [N] [table] */
+			int topn = 0;
+			const char *only = NULL;
+			char *buf;
+
+			if (argc > 2)
+				topn = atoi(argv[2]);
+			if (argc > 3)
+				only = argv[3];
+			buf = (char *)malloc(65536);
+			if (!buf) {
+				stream->write_function(stream, "sqlstats: out of memory\n");
+				return SWITCH_STATUS_SUCCESS;
+			}
+			switch_mutex_lock(glob->stats_mutex);
+			tnt_stats_show(&glob->stats, topn, only, buf, 65536);
+			switch_mutex_unlock(glob->stats_mutex);
+			stream->write_function(stream, "%s", buf);
+			free(buf);
+		} else if (!strcasecmp(what, "on") || !strcasecmp(what, "off")) {
+			int on = !strcasecmp(what, "on");
+
+			switch_mutex_lock(glob->stats_mutex);
+			glob->stats.enabled = on;
+			switch_mutex_unlock(glob->stats_mutex);
+			stream->write_function(stream, "sqlstats: %s\n", on ? "on" : "off");
+		} else if (!strcasecmp(what, "reset")) {
+			/* counters cleared AND filter restored to "all"; the on/off
+			 * state is intentionally preserved */
+			switch_mutex_lock(glob->stats_mutex);
+			tnt_stats_reset(&glob->stats);
+			switch_mutex_unlock(glob->stats_mutex);
+			stream->write_function(stream, "sqlstats: counters cleared, filter=all\n");
+		} else if (!strcasecmp(what, "tables")) {
+			/* tarantool sqlstats tables            -> show current filter
+			 * tarantool sqlstats tables all        -> filter = all
+			 * tarantool sqlstats tables t1 [t2...] -> REPLACE the filter */
+			if (argc == 2) {
+				switch_mutex_lock(glob->stats_mutex);
+				if (glob->stats.ntables < 0) {
+					stream->write_function(stream, "sqlstats: filter=all\n");
+				} else {
+					int k;
+
+					stream->write_function(stream, "sqlstats: filter (%d):",
+										   glob->stats.ntables);
+					for (k = 0; k < glob->stats.ntables; k++)
+						stream->write_function(stream, " %s", glob->stats.tables[k]);
+					stream->write_function(stream, "\n");
+				}
+				switch_mutex_unlock(glob->stats_mutex);
+			} else if (argc == 3 && !strcasecmp(argv[2], "all")) {
+				switch_mutex_lock(glob->stats_mutex);
+				tnt_stats_tables_set(&glob->stats, NULL, 0);
+				switch_mutex_unlock(glob->stats_mutex);
+				stream->write_function(stream, "sqlstats: filter=all\n");
+			} else {
+				/* foolproofing: replace semantics, lower-case, silent dedup,
+				 * cap 32; echo the applied list so the operator sees exactly
+				 * what is in effect */
+				int applied;
+
+				switch_mutex_lock(glob->stats_mutex);
+				applied = tnt_stats_tables_set(&glob->stats,
+											   (const char *const *)&argv[2],
+											   argc - 2);
+				stream->write_function(stream, "sqlstats: filter set (%d):",
+									   applied);
+				if (glob->stats.ntables <= 0) {
+					stream->write_function(stream, " all");
+				} else {
+					int k;
+
+					for (k = 0; k < glob->stats.ntables; k++)
+						stream->write_function(stream, " %s", glob->stats.tables[k]);
+				}
+				switch_mutex_unlock(glob->stats_mutex);
+				stream->write_function(stream, "\n");
+				if (applied < argc - 2)
+					stream->write_function(stream,
+										   "sqlstats: WARNING input had %d names, filter limited to %d\n",
+										   argc - 2, applied);
+			}
+		} else {
+			stream->write_function(stream,
+								   "Usage: tarantool sqlstats on|off|reset|tables|show\n");
+		}
+	} else if (!strcasecmp(sub, "cache")) {
+		const char *what = argc > 1 ? argv[1] : NULL;
+
+		if (!what || !strcasecmp(what, "show")) {
+			/* tarantool cache show [N] [full] */
+			int topn = 0, full = 0;
+			char *buf;
+
+			if (argc > 2)
+				topn = atoi(argv[2]);
+			if (argc > 3 && !strcasecmp(argv[3], "full"))
+				full = 1;
+			buf = (char *)malloc(65536);
+			if (!buf) {
+				stream->write_function(stream, "cache: out of memory\n");
+				return SWITCH_STATUS_SUCCESS;
+			}
+			switch_mutex_lock(glob->cache_mutex);
+			tnt_tcache_show(&glob->tcache, topn, full, buf, 65536);
+			switch_mutex_unlock(glob->cache_mutex);
+			stream->write_function(stream, "%s", buf);
+			free(buf);
+		} else if (!strcasecmp(what, "on") || !strcasecmp(what, "off")) {
+			int on = !strcasecmp(what, "on");
+
+			switch_mutex_lock(glob->cache_mutex);
+			glob->tcache.enabled = on;
+			if (!on)
+				tnt_tcache_invalidate(&glob->tcache);
+			switch_mutex_unlock(glob->cache_mutex);
+			stream->write_function(stream, "cache: %s%s\n", on ? "on" : "off",
+								   on ? "" : " (entries invalidated)");
+		} else if (!strcasecmp(what, "reset")) {
+			switch_mutex_lock(glob->cache_mutex);
+			tnt_tcache_reset(&glob->tcache);
+			switch_mutex_unlock(glob->cache_mutex);
+			stream->write_function(stream, "cache: cleared, counters reset\n");
+		} else {
+			stream->write_function(stream,
+								   "Usage: tarantool cache on|off|reset|show [N] [full]\n");
+		}
+	} else if (!strcasecmp(sub, "cb")) {
+		const char *what = argc > 1 ? argv[1] : NULL;
+
+		if (!what || !strcasecmp(what, "show")) {
+			/* tarantool cb show */
+			char *buf = (char *)malloc(16384);
+
+			if (!buf) {
+				stream->write_function(stream, "cb: out of memory\n");
+				return SWITCH_STATUS_SUCCESS;
+			}
+			tnt_cb_show(buf, 16384);
+			stream->write_function(stream, "%s", buf);
+			free(buf);
+		} else if (!strcasecmp(what, "reset")) {
+			tnt_cb_reset_all();
+			stream->write_function(stream, "cb: all breakers reset to closed\n");
+		} else {
+			stream->write_function(stream, "Usage: tarantool cb show|reset\n");
+		}
+	} else if (!strcasecmp(sub, "prepare")) {
+		const char *what = argc > 1 ? argv[1] : NULL;
+
+		if (!what || !strcasecmp(what, "show")) {
+			/* tarantool prepare show */
+			int k;
+
+			/* per-profile config (static snapshot) */
+			switch_mutex_lock(glob->mutex);
+			for (k = 0; k < glob->nprofiles; k++) {
+				int hi;
+				int on_hosts = 0;
+
+				for (hi = 0; hi < glob->profiles[k].nhosts; hi++)
+					on_hosts += glob->profiles[k].hosts[hi].prepare > 0;
+				stream->write_function(stream, "profile '%s': prepare on %d/%d host(s)\n",
+									   glob->profiles[k].name, on_hosts,
+									   glob->profiles[k].nhosts);
+			}
+			switch_mutex_unlock(glob->mutex);
+
+			/* live connections (config + runtime overrides), one line per
+			 * pool connection */
+			switch_mutex_lock(glob->mutex);
+			for (k = 0; k < glob->nhandles; k++) {
+				tnt_handle_t *hh = glob->handles[k];
+				int si;
+
+				if (!hh)
+					continue;
+				for (si = 0; si < hh->pool_size; si++) {
+					tnt_session_t *ss = &hh->sessions[si];
+
+					if (hh->conn_locks[si])
+						switch_mutex_lock(hh->conn_locks[si]);
+					stream->write_function(stream, "conn '%s'[%d/%d]: prepare %s, server %d.%d, %s\n",
+										   hh->profile_name, si, hh->pool_size,
+										   ss->conn.prepare_allowed ? "allowed" : "off",
+										   ss->conn.server_major,
+										   ss->conn.server_minor,
+										   ss->conn.prepare_supported ?
+											   "PREPARE ok" : "PREPARE unsupported (<2.11)");
+					if (hh->conn_locks[si])
+						switch_mutex_unlock(hh->conn_locks[si]);
+				}
+			}
+			switch_mutex_unlock(glob->mutex);
+
+			switch_mutex_lock(glob->cache_mutex);
+			{
+				uint64_t lookups = glob->p_phits + glob->p_prepares;
+				double hr = lookups ? (100.0 * (double)glob->p_phits / (double)lookups) : 0.0;
+
+				stream->write_function(stream,
+									   "prepares: %llu  execs: %llu  prep-cache hits: %llu (%.2f%%)  fallbacks: %llu  errors: %llu\n",
+									   (unsigned long long)glob->p_prepares,
+									   (unsigned long long)glob->p_execs,
+									   (unsigned long long)glob->p_phits, hr,
+									   (unsigned long long)glob->p_fallbacks,
+									   (unsigned long long)glob->p_errors);
+			}
+			switch_mutex_unlock(glob->cache_mutex);
+		} else if (!strcasecmp(what, "on") || !strcasecmp(what, "off")) {
+			/* runtime override: applied to every LIVE connection; reverts
+			 * to the host config on reconnect (tnt_conn_init) */
+			int on = !strcasecmp(what, "on");
+			int k, n = 0;
+
+			switch_mutex_lock(glob->mutex);
+			for (k = 0; k < glob->nhandles; k++) {
+				tnt_handle_t *hh = glob->handles[k];
+				int si;
+
+				if (!hh)
+					continue;
+				for (si = 0; si < hh->pool_size; si++) {
+					if (hh->conn_locks[si])
+						switch_mutex_lock(hh->conn_locks[si]);
+					hh->sessions[si].conn.prepare_allowed = on;
+					n++;
+					if (hh->conn_locks[si])
+						switch_mutex_unlock(hh->conn_locks[si]);
+				}
+			}
+			switch_mutex_unlock(glob->mutex);
+			stream->write_function(stream,
+								   "prepare: %s for %d live connection(s) (reverts to config on reconnect)\n",
+								   on ? "on" : "off", n);
+		} else if (!strcasecmp(what, "reset")) {
+			switch_mutex_lock(glob->cache_mutex);
+			glob->p_prepares = 0;
+			glob->p_execs = 0;
+			glob->p_phits = 0;
+			glob->p_fallbacks = 0;
+			glob->p_errors = 0;
+			switch_mutex_unlock(glob->cache_mutex);
+			stream->write_function(stream, "prepare: counters reset\n");
+		} else {
+			stream->write_function(stream, "Usage: tarantool prepare on|off|reset|show\n");
+		}
 	} else if (!strcasecmp(sub, "debug")) {
 		const char *what = argc > 1 ? argv[1] : NULL;
 		const char *pname = argc > 2 ? argv[2] : NULL;
@@ -1662,45 +2871,50 @@ SWITCH_STANDARD_API(api_tarantool)
 		switch_mutex_lock(glob->mutex);
 		for (i = 0; i < glob->nhandles; i++) {
 			tnt_handle_t *h = glob->handles[i];
-			const tnt_host_cfg_t *ch;
-			int64_t idle_ms, now_ms;
+			int si;
 
 			if (!h)
 				continue;
 			if (pname && strcasecmp(pname, h->profile_name))
 				continue;
-			ch = &h->profile.hosts[h->session.cur >= 0 && h->session.cur < h->profile.nhosts ?
-								  h->session.cur : 0];
-			now_ms = switch_micro_time_now() / 1000;
-			idle_ms = now_ms - h->session.conn.last_used_mono;
-			if (idle_ms < 0)
-				idle_ms = 0;
+			for (si = 0; si < h->pool_size; si++) {
+				tnt_session_t *s = &h->sessions[si];
+				const tnt_host_cfg_t *ch;
+				int64_t idle_ms, now_ms;
 
-			stream->write_function(stream,
-								   "[%d] profile=%s fd=%d %s%s%s:%u v%s cur=%d queries=%" PRIu64 "\n",
-								   shown, h->profile_name, h->session.conn.fd,
-								   ch->use_unix ? "unix:" : "", ch->addr,
-								   ch->use_unix ? "" : ":", ch->port,
-								   ch->version[0] ? ch->version : "?",
-								   h->session.cur, h->n_queries);
-			{
-				char agebuf[32];
-				int64_t age_s = h->created_mono ? (now_ms - h->created_mono) / 1000 : 0;
+				ch = &h->profile.hosts[s->cur >= 0 && s->cur < h->profile.nhosts ? s->cur : 0];
+				now_ms = switch_micro_time_now() / 1000;
+				idle_ms = now_ms - s->conn.last_used_mono;
+				if (idle_ms < 0)
+					idle_ms = 0;
 
-				tnt_fmt_age(age_s, agebuf, sizeof(agebuf));
 				stream->write_function(stream,
-									   "    caller=%s:%d %s idle=%" PRId64 "ms auto_commit=%s last_affected=%d age=%s\n",
-									   h->caller_file[0] ? h->caller_file : "?",
-									   h->caller_line,
-									   h->caller_func[0] ? h->caller_func : "?",
-									   idle_ms,
-									   h->auto_commit ? "true" : "false",
-									   h->affected_rows,
-									   agebuf);
+									   "[%d] profile=%s conn=%d/%d fd=%d %s%s%s:%u v%s cur=%d queries=%" PRIu64 "%s\n",
+									   shown, h->profile_name, si, h->pool_size, s->conn.fd,
+									   ch->use_unix ? "unix:" : "", ch->addr,
+									   ch->use_unix ? "" : ":", ch->port,
+									   ch->version[0] ? ch->version : "?",
+									   s->cur, h->n_queries,
+									   (h->tx_pinned && h->tx_idx == si) ? " [tx]" : "");
+				{
+					char agebuf[32];
+					int64_t age_s = h->created_mono ? (now_ms - h->created_mono) / 1000 : 0;
+
+					tnt_fmt_age(age_s, agebuf, sizeof(agebuf));
+					stream->write_function(stream,
+										   "    caller=%s:%d %s idle=%" PRId64 "ms auto_commit=%s last_affected=%d age=%s\n",
+										   h->caller_file[0] ? h->caller_file : "?",
+										   h->caller_line,
+										   h->caller_func[0] ? h->caller_func : "?",
+										   idle_ms,
+										   h->auto_commit ? "true" : "false",
+										   h->affected_rows,
+										   agebuf);
+				}
+				if (s->conn.fd >= 0)
+					up++;
+				shown++;
 			}
-			if (h->session.conn.fd >= 0)
-				up++;
-			shown++;
 		}
 		switch_mutex_unlock(glob->mutex);
 
@@ -1903,32 +3117,8 @@ out:
 static switch_thread_t *maint_thread = NULL;
 static int maint_thread_running = 0;
 
-/* Replace every "${now}" in src with the given epoch value. Never overflows
- * dstcap; the result is always NUL-terminated. */
-static void tnt_maint_replace_now(const char *src, char *dst, size_t dstcap,
-								  time_t now)
-{
-	static const char tok[] = "${now}";
-	const size_t tl = sizeof(tok) - 1;
-	size_t i = 0, o = 0, n = strlen(src);
-	char num[32];
-
-	snprintf(num, sizeof(num), "%ld", (long) now);
-	while (i < n && o + 1 < dstcap) {
-		if (n - i >= tl && !strncmp(src + i, tok, tl)) {
-			size_t nl = strlen(num);
-
-			if (o + nl + 1 > dstcap)
-				break;
-			memcpy(dst + o, num, nl);
-			o += nl;
-			i += tl;
-		} else {
-			dst[o++] = src[i++];
-		}
-	}
-	dst[o] = '\0';
-}
+/* tnt_maint_replace_now() was replaced by tnt_maint_expand() (see above):
+ * it handles ${now} plus the extended variable set. */
 
 /* Run one <sql> body (already ${now}-expanded): split on ';' and execute
  * each statement through the normal pipeline (translate + quote_reserved).
@@ -2046,7 +3236,18 @@ static void tnt_maint_iteration(void)
 
 			if (strcasecmp(snap[j].profile, snap[i].profile))
 				continue;
-			tnt_maint_replace_now(snap[j].sql, expanded, sizeof(expanded), now);
+			{
+				char badvar[128];
+
+				if (tnt_maint_expand(snap[j].sql, expanded, sizeof(expanded), now,
+									 badvar, sizeof(badvar)) != 0) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  "mod_tarantool: <maintenance> profile=%s expansion "
+									  "failed (%s), entry skipped\n  sql: %.1024s\n",
+									  snap[j].profile, badvar, snap[j].sql);
+					continue;
+				}
+			}
 			tnt_maint_execute_sql(&s, rr, snap[j].profile, expanded);
 		}
 		tnt_session_close(&s);
@@ -2108,6 +3309,31 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_tarantool_load)
 	glob->pool = pool;
 	if (switch_mutex_init(&glob->mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "mod_tarantool: cannot init mutex\n");
+		free(glob);
+		glob = NULL;
+		return SWITCH_STATUS_TERM;
+	}
+
+	/* runtime SQL statistics ("tarantool sqlstats ..."); disabled until
+	 * explicitly switched on, filter defaults to "all" */
+	tnt_stats_init(&glob->stats);
+	if (switch_mutex_init(&glob->stats_mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+						  "mod_tarantool: cannot init stats mutex\n");
+		switch_mutex_destroy(glob->mutex);
+		free(glob);
+		glob = NULL;
+		return SWITCH_STATUS_TERM;
+	}
+
+	/* statement translate cache ("tarantool cache ..."); the enabled flag
+	 * and contents are armed by config_load() (which must run after this) */
+	tnt_tcache_init(&glob->tcache, TNT_TCACHE_MAX);
+	if (switch_mutex_init(&glob->cache_mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+						  "mod_tarantool: cannot init cache mutex\n");
+		switch_mutex_destroy(glob->stats_mutex);
+		switch_mutex_destroy(glob->mutex);
 		free(glob);
 		glob = NULL;
 		return SWITCH_STATUS_TERM;
@@ -2192,6 +3418,14 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_tarantool_shutdown)
 	}
 
 	if (glob) {
+		if (glob->cache_mutex) {
+			switch_mutex_lock(glob->cache_mutex);
+			tnt_tcache_invalidate(&glob->tcache);
+			switch_mutex_unlock(glob->cache_mutex);
+			switch_mutex_destroy(glob->cache_mutex);
+		}
+		if (glob->stats_mutex)
+			switch_mutex_destroy(glob->stats_mutex);
 		switch_mutex_destroy(glob->mutex);
 		free(glob);
 		glob = NULL;

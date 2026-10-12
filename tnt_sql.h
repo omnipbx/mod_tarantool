@@ -1,36 +1,36 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* tnt_sql.h -- lightweight SQL scanner: statement splitter and classifier.
-*
-* The splitter uses a deterministic state machine (quoted strings with ''
-* escaping, line/block comments, balanced parentheses). Semicolons inside
-* string literals or comments are never treated as statement separators.
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * tnt_sql.h -- lightweight SQL scanner: statement splitter and classifier.
+ *
+ * The splitter uses a deterministic state machine (quoted strings with ''
+ * escaping, line/block comments, balanced parentheses). Semicolons inside
+ * string literals or comments are never treated as statement separators.
+ *
+ */
 
 #ifndef TNT_SQL_H
 #define TNT_SQL_H
@@ -95,5 +95,66 @@ SWITCH_DECLARE(size_t) tnt_sql_quote_reserved(const char *src, char *dst, size_t
  * (reason_cap bytes, NUL-terminated) carries a human-readable cause. */
 SWITCH_DECLARE(int) tnt_sql_validate(const char *sql, int want_select,
 									 char *reason, size_t reason_cap);
+
+/* ---- statement templateize (translate-cache key layer) ---- */
+
+/* Marker byte replacing data literals inside a statement template.
+ * Impossible in valid SQL text; never produced by translate/quote. */
+#define TNT_SQL_TPL_MARK	'\001'
+
+/* Max number of data literals extracted from one statement; statements
+ * with more are not cacheable. */
+#define TNT_SQL_VALS_MAX	32
+/* Max literal payload length; longer literals make the statement
+ * uncacheable. */
+#define TNT_SQL_VAL_MAX		512
+
+typedef struct tnt_sql_val {
+	char text[TNT_SQL_VAL_MAX];	/* literal payload (''-unescaped for strings) */
+	int is_string;				/* 1 = single-quoted literal, 0 = bare number */
+} tnt_sql_val_t;
+
+/* Replace data literals in the statement span with TNT_SQL_TPL_MARK bytes
+ * and collect them (in order) into vals. The template is lowercased and
+ * whitespace-collapsed, so its hash is stable across calls of the same
+ * statement shape with different literals. Quoted identifiers ("..."),
+ * comments and everything else are copied verbatim. Returns 0 on success,
+ * -1 when the statement is not cacheable (payload overflow, too many
+ * literals, marker byte in the source). */
+SWITCH_DECLARE(int) tnt_sql_templateize(const char *sql, size_t start, size_t end,
+										char *tpl, size_t tplcap,
+										tnt_sql_val_t *vals, int maxvals, int *nvals);
+
+/* Rebuild a concrete statement from a template: every TNT_SQL_TPL_MARK
+ * byte is replaced by the next value (strings are re-quoted with ''
+ * escaping, numbers copied verbatim). Returns 0 on success, -1 when the
+ * marker count does not match nvals or the output does not fit. */
+SWITCH_DECLARE(int) tnt_sql_rebuild(const char *tpl, const tnt_sql_val_t *vals,
+									int nvals, char *out, size_t cap);
+
+/* Convert a template into a Tarantool prepared-statement text: every
+ * TNT_SQL_TPL_MARK byte becomes a positional '?' parameter. Returns 0 on
+ * success, -1 when the output does not fit (cap includes the NUL). */
+SWITCH_DECLARE(int) tnt_sql_tpl_qmarks(const char *tpl, char *out, size_t cap);
+
+/* Detect data literals in the SELECT list of a statement template, i.e.
+ * marker bytes before the first FROM keyword. Tarantool SQL cannot type
+ * anonymous '?' parameters in the SELECT list (PREPARE fails with
+ * "Supplied key type of part N ..."), so such literals must stay constants
+ * in the prepared text. Returns 1 when the template is a SELECT and carries
+ * at least one marker before FROM (or anywhere, when there is no FROM),
+ * 0 otherwise. Used once at cache-store time to tag the entry. */
+SWITCH_DECLARE(int) tnt_sql_has_select_markers(const char *tpl, size_t len);
+
+/* Materialize the SELECT-list literals of a statement template into
+ * concrete quoted literals and remove their values from the front of vals
+ * (the array is compacted in place, *nvals reduced). The result is a
+ * "partially materialized" template: constants in the SELECT list, marker
+ * bytes everywhere else - exactly what Tarantool's PREPARE accepts. When
+ * the template has no markers before FROM, out is a verbatim copy and
+ * nothing is removed. Returns 0 on success, -1 on marker/vals mismatch or
+ * output overflow (vals is left untouched on failure). */
+SWITCH_DECLARE(int) tnt_sql_materialize_select(const char *tpl, tnt_sql_val_t *vals,
+											   int *nvals, char *out, size_t cap);
 
 #endif /* TNT_SQL_H */

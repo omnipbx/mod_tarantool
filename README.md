@@ -14,7 +14,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.3)
+## Возможности (v1.0.7)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -41,9 +41,35 @@ PostgreSQL.
 - **Батч-запросы**: SQL вида `stmt1;stmt2;...` (типично для mod_sofia)
   разбивается корректным сплиттером (строки `''`, комментарии, скобки) и
   выполняется последовательно.
+- **Транзакционность батчей** *(в разработке, v1.0.4)*: DML-батчи будут
+  выполняться атомарно через IPROTO streams — отдельные пакеты
+  `IPROTO_EXECUTE` с общим ненулевым `IPROTO_STREAM_ID` (сервер привязывает
+  их к одному файберу, транзакция `BEGIN; stmt1; …; COMMIT;` становится
+  сквозной; при разрыве связи сервер откатывает её сам, при таймауте модуль
+  шлёт явный `ROLLBACK` в том же стриме). DDL-батчи остаются вне стрима —
+  DDL в Tarantool не транзакционен. Требование сервера: Tarantool ≥2.11
+  (у 3.x — есть). См. «Особенности протокола, учтённые в реализации».
 - **Мультипоточность**: соединение на (поток × callsite); каждый
   `handle_new` создаёт глубокую копию профиля+правил, поэтому reload
   конфигурации не рвёт активные соединения.
+- **Пул соединений** (`pool-size`, v1.0.5): каждый handle держит до 8
+  независимых соединений (round-robin, per-conn мьютекс вместо глобальной
+  сериализации, транзакции на закреплённом соединении, immutable-снапшот
+  правил для параллельной трансляции). `pool-size=1` — классическое
+  поведение.
+- **Shared circuit breaker** (`cb-mode`, v1.0.6): per-host автомат
+  `CLOSED → OPEN → HALF_OPEN` в глобальном реестре (ключ `addr:port`),
+  общий для всех профилей/пулов. Режимы `off` (классический backoff),
+  `wait` (запросы спят до конца окна — безопасно для
+  `switch_cache_db_test_reactive`) и `fast` (мгновенный отказ). Порог
+  отказов, окно OPEN, метрики и CLI `tarantool cb show|reset`.
+- **Материализация SELECT-литералов** (`literal`, v1.0.7): Tarantool SQL не
+  умеет типизировать анонимные `'?'` в SELECT-списке (`PREPARE` падает с
+  «Supplied key type of part N …»). Записи кэша, у которых в SELECT-блоке
+  есть литералы, помечаются флагом `literal` (вычисляется один раз при
+  записи); перед `IPROTO_PREPARE` такие литералы материализуются в
+  константы, а их значения изымаются из bind-массива. Ключ кэша остаётся
+  стабильным (маркеры везде) — раздувания `cache` нет.
 - **CLI API**: команда `tarantool` в fs_cli.
 
 ---
@@ -63,6 +89,12 @@ src/mod/databases/mod_tarantool/
 │                          #   операторов (CREATE/DROP/INSERT/UPDATE/...)
 ├── tnt_rules.c/.h         # транслятор DDL (primaryKey/primaryKeyAdd/
 │                          #   addField, BIGINT→INTEGER, VIEW no-op и т.д.)
+├── tnt_stats.c/.h         # runtime SQL-статистика ("tarantool sqlstats"),
+│                          #   чистый слой без switch_* (фильтр таблиц,
+│                          #   нормализация литералов, FNV-хэш шаблонов)
+├── tnt_tcache.c/.h        # динамический кэш трансляции ("tarantool cache"),
+│                          #   чистый слой без switch_* (fetch/store/show,
+│                          #   eviction least-hits, приватные копии на hit)
 └── mp_decode.c/.h         # минимальный MessagePack decoder/encoder
                           #   (без внешних зависимостей)
 ```
@@ -190,12 +222,21 @@ sudo make install       # установит модуль и conf/tarantool.conf
 | `ping-idle` | проверка простаивающих соединений через IPROTO_PING, мс (0 = выкл.) |
 | `ping-timeout` | таймаут пинга, мс |
 | `debug` | `true`/`false` — SQL-трассировка каждого запроса (in от ядра, out в Tarantool) по умолчанию; переключается в рантайме командой `tarantool debug` |
+| `cache` | `false` (по умолчанию)/`true` — кэш трансляции statement'ов по **нормализованному шаблону** (см. `tarantool cache`): литералы данных заменяются маркерами, ключ устойчив к разным значениям; на hit литералы конкретного вызова подставляются обратно. `false` — обход кэша и очистка (kill-switch); применяется hot через `reload` и командой `tarantool cache on/off` |
+| `cb-mode` | `off` (по умолчанию)/`wait`/`fast` — режим shared circuit breaker (см. раздел «Circuit breaker»). `wait` — при OPEN запросы спят до конца окна (безопасно для ядра FreeSWITCH); `fast` — мгновенный отказ; `off` — классический per-conn backoff |
+| `cb-failure-threshold` | число подряд идущих транспортных отказов до открытия breaker (по умолчанию `3`) |
+| `cb-timeout` | длина окна OPEN, мс (по умолчанию `5000`) |
 
 ### `<profiles>` — пулы подключений
 
 Каждый профиль имеет атрибут `name` (имя из DSN) , `version` (ветка
 Tarantool: `2.10` или `3.2`) и `skip-index` (игнорирование index `false` / `true`) . Адрес — либо inline-параметры, либо секция
 `<hosts>` для failover.
+
+Профильный параметр `<param name="prepare"/>` — **default для всех хостов
+профиля**; хост может переопределить его своим `<param name="prepare"/>`
+внутри `<host>` (наследование профиль → хост). Подробности — в разделе
+[`prepare` — подготовленные statements](#prepare--подготовленные-statements-iproto_prepare--bind).
 
 > **Максимальное число профилей — 32** (`TNT_PROFILES_MAX`). Профили сверх
 > лимита игнорируются с предупреждением в лог. Массив профилей хранится на
@@ -231,6 +272,7 @@ Tarantool: `2.10` или `3.2`) и `skip-index` (игнорирование inde
 |---|---|
 | `full-scan` | `true` (по умолчанию) — на каждом новом соединении к любому хосту профиля выполняется `SET SESSION sql_full_scan=true` (Tarantool 2.11/3.x), при неизвестной переменной — фолбэк `SET SESSION sql_seq_scan=true` (старые 2.x); `false` — не включать. Без этого ядро FreeSWITCH не сможет выполнять полные сканы (реактивные probe-запросы) — каждый старт заканчивается DROP+CREATE всех таблиц |
 | `init-sql` | произвольный SQL, выполняемый сразу после успешного connect к любому хосту профиля (и после каждого failover-переподключения); ошибка «неизвестная переменная» — benign, остальные логируются warning без обрыва соединения |
+| `pool-size` | размер пула соединений на один handle (1..8, по умолчанию 1). Каждый handle держит до `pool-size` независимых соединений (у каждого — свой failover-цикл и свой кэш prepared statements) и распределяет statement'ы round-robin. `1` = классическое «один handle — одно соединение»; `>1` позволяет параллельно выполнять statement'ы на разных соединениях (см. раздел [«Пул соединений»](#пул-соединений-pool-size)) |
 
 Атрибут профиля:
 
@@ -249,6 +291,7 @@ Tarantool: `2.10` или `3.2`) и `skip-index` (игнорирование inde
   <param name="query-timeout" value="3000"/>
   <param name="full-scan" value="true"/>
   <!-- <param name="init-sql" value="SET SESSION sql_full_scan=true"/> -->
+  <!-- <param name="pool-size" value="4"/> -->
 </profile>
 ```
 
@@ -484,6 +527,7 @@ Tarantool 2.x+; LEFT JOIN и `NOT IN (SELECT ...)` проверены на 3.2):
 | view больше 8 | не фатально: лишние view игнорируются, в консоль WARNING «view limit reached» |
 | пустое имя/тело | WARNING «empty name or body», entry игнорируется |
 | невалидное тело (не один SELECT, битые кавычки/скобки, нераспознанный SQL) | WARNING «invalid SQL, view NOT applied: <причина>», view игнорируется |
+| в теле найден placeholder (`${…}` / `$${…}`) | WARNING «placeholder '…' is not allowed in view bodies», view игнорируется — динамика в статической подстановке VIEW замёрзла бы на момент загрузки |
 
 Правило: лучше жёстко отказаться от битой конфигурации, чем молча потерять
 view из-за усечения — после исправления размера выполните `load`/`reload`
@@ -518,8 +562,19 @@ view из-за усечения — после исправления разме
   профиля группируются в одну сессию за итерацию; порядок сохраняется;
 - в одном `<sql>` можно перечислять несколько запросов через `;` — они
   разбиваются (`tnt_sql_split`) и выполняются поочерёдно в той же сессии;
-- **`${now}`** заменяется на текущий unixtime (Tarantool SQL не имеет
-  `CURRENT_TIMESTAMP`);
+- **динамические переменные** раскрываются на каждой итерации (Tarantool SQL
+  не имеет `CURRENT_TIMESTAMP`, поэтому время всегда подставляется свежим):
+  | Переменная | Значение |
+  |---|---|
+  | `${now}` / `${epoch}` | `(long)` времени итерации (unixtime) |
+  | `${hostname}` / `${switchname}` | имя узла (`switch_core_get_switchname()`) |
+  | `${strftime(<fmt>)}` | текущее время по формату, например `${strftime(%H%M)}` |
+  Значения подставляются только **вне** строковых литералов `'…'`. Неизвестная
+  переменная → SQL считается битым: WARNING с текстом SQL и самим токеном
+  (`unknown maintenance variable '${…}'`), запись НЕ применяется на
+  load/reload и пропускается на итерации. Напоминание: `$${…}` (глобалы FS)
+  раскрывает препроцессор ядра ещё при чтении конфига — неизвестный глобал
+  ядро удаляет молча, получившийся битый SQL ловит валидатор;
 - поток работает только пока загружен `mod_sofia`
   (`switch_loadable_module_exists`), иначе итерации пропускаются;
 - недоступные хосты профиля → WARNING + пропуск группы (без падения);
@@ -544,11 +599,14 @@ view из-за усечения — после исправления разме
 **Применяется к АКТИВНЫМ соединениям сразу (hot-reload):**
 
 - все секции правил — `<reserved>`, `<views>`, `<primaryKey>`/`<primaryKeyAdd>`,
-  `<addField>`, `<intColumns>`. Они лежат в одной структуре `tnt_rules_t`,
-  поэтому заменяются **оптом** (одним присваиванием) на каждом открытом хендле
-  под его собственной блокировкой: текущий SQL-вызов (весь батч) не рвётся,
-  а следующий запрос любого активного соединения уже транслируется по новой
-  конфигурации. В лог: `rules hot-applied to N active connection(s)`.
+  `<addField>`, `<intColumns>`. Они лежат в одной структуре `tnt_rules_t`;
+  reload инкрементирует `rules_epoch`, а каждое активное соединение обновляет
+  правила **лениво** — при первом же SQL-вызове, увидев чужой epoch (копия
+  ~40 КБ один раз на хендл за reload, под `glob->mutex` и локом хендла).
+  Кэш трансляции при этом очищается целиком. В лог:
+  `rules epoch -> N (handles refresh lazily)`.
+- `<param name="cache"/>` — горячо: новое значение из конфига применяется к
+  кэшу (включение/выключение + очистка).
 
 **Применяется на лету при `reload`:**
 
@@ -602,6 +660,11 @@ box.cfg({
     memtx_dir = '/var/lib/tarantool/socket',
     wal_dir   = '/var/lib/tarantool/socket',
     read_only = false,
+    -- MVCC для memtx: параллельный DML из нескольких соединений FreeSWITCH
+    -- (channels/calls/sip_registrations) без взаимных блокировок; обязателен
+    -- при нагрузке выше единиц CPS и для будущих транзакционных батчей
+    -- (IPROTO streams).
+    memtx_use_mvcc_engine = true,
 })
 -- Auth user (as before)
 local ok, err = pcall(function()
@@ -670,6 +733,10 @@ tarantool ping [profile]      # ping пула — первый доступны�
 tarantool check [profile]     # ping каждого хоста профиля по отдельности
 tarantool sql <profile> <q>   # выполнить сырой SQL-запрос
 tarantool translate <q>       # показать результат трансляции DDL
+tarantool sqlstats on|off|reset|tables|show   # статистика SQL-шаблонов
+tarantool cache on|off|reset|show [N] [full]  # кэш трансляции
+tarantool prepare on|off|reset|show           # подготовленные statements
+tarantool cb show|reset                       # shared circuit breaker
 tarantool reload              # перечитать tarantool.conf.xml
 tarantool drop                # освобождение ресурсов (no-op в v1)
 tarantool version             # версия модуля
@@ -692,12 +759,15 @@ tarantool translate "create table channels (uuid varchar(255), name varchar(255)
 local: 1/2 hosts up
 ```
 
-Пример вывода `conns` (активные соединения с инициаторами):
+Пример вывода `conns` (активные соединения с инициаторами; при
+`pool-size > 1` каждый handle показывает все свои соединения пула,
+`conn=N/M` — номер соединения и размер пула, `[tx]` — соединение,
+закреплённое за текущей транзакцией):
 
 ```
-[0] profile=local fd=23 unix:/var/lib/tarantool/socket/tarantool.control:3301 v3.2 cur=0 queries=842
+[0] profile=local conn=0/1 fd=23 unix:/var/lib/tarantool/socket/tarantool.control:3301 v3.2 cur=0 queries=842
     caller=sofia_reg.c:2578 sofia_reg_handle_sip_r_register idle=12ms auto_commit=true last_affected=1 age=36s
-[1] profile=local fd=24 unix:/var/lib/tarantool/socket/tarantool.control:3301 v3.2 cur=0 queries=57
+[1] profile=local conn=0/1 fd=24 unix:/var/lib/tarantool/socket/tarantool.control:3301 v3.2 cur=0 queries=57
     caller=switch_core_sqldb.c:2829 switch_core_db_handle_new idle=800ms auto_commit=true last_affected=-1 age=1d 02:03:04
 2 connection(s), 2 up
 ```
@@ -715,6 +785,358 @@ mod_tarantool[debug] profile=local in sofia_reg.c:2578 sofia_reg_handle_sip_r_re
   sql: INSERT INTO sip_registrations (...) VALUES (...);
 mod_tarantool[debug] profile=local out sofia_reg.c:2578 sofia_reg_handle_sip_r_register
   sql: INSERT INTO sip_registrations (...) VALUES (...);
+```
+
+### `sqlstats` — статистика SQL-шаблонов в runtime
+
+Семейство команд `tarantool sqlstats ...` считает, какая доля SQL-потока
+повторяется (по нормализованным шаблонам) — основа для оценки кэша
+трансляции и `IPROTO_PREPARE + bind`. Исходные SQL-строки с данными не
+хранятся: в памяти остаются только нормализованные сэмплы (литералы
+заменены на `?`), PII в вывод не попадает.
+
+```
+tarantool sqlstats on                     # начать накопление
+tarantool sqlstats off                    # остановить (данные сохраняются)
+tarantool sqlstats reset                  # счётчики=0 И фильтр=all (on/off не трогает)
+tarantool sqlstats tables                 # показать текущий фильтр
+tarantool sqlstats tables t1 t2 ...       # ЗАМЕНИТЬ фильтр списком таблиц
+tarantool sqlstats tables all             # фильтр = все таблицы
+tarantool sqlstats show [N] [table]       # сводка + топ-N шаблонов
+```
+
+Правила фильтра таблиц:
+
+- **replace-семантика**: каждый вызов `tables` полностью заменяет список;
+- дубликаты сворачиваются молча, имена приводятся к нижнему регистру,
+  сравнение регистронезависимо (`Channels` ≡ `channels`);
+- лимит **32** имени (лишние игнорируются с WARNING в выводе команды);
+- view-имена поддерживаются без отдельного синтаксиса: для `SELECT`
+  учитывается первое имя после верхнеуровневого `FROM` (имя view — как
+  есть, `(...)` → `*subquery*`, второй источник → суффикс ` (join)`);
+- проверка фильтра выполняется **до** нормализации/хэширования: таблица
+  вне списка стоит только скан имени, не хэш.
+
+Пока `sqlstats off` — нулевой overhead: ничего не считается и не
+хэшируется. При `on` overhead — один проход по statement (нормализация +
+FNV-1a-64 хэш), при off-нагрузке для диагностики это несущественно.
+
+Пример вывода `show`:
+
+```
+sqlstats: state=on filter: all
+statements: total=501911 counted=501911 filtered-out=0
+type      total      distinct   top-hit
+SELECT    182344         12         96214
+INSERT    153980        340          2103
+UPDATE     88721         96         34011
+DELETE     76554         88         40231
+by (type, table):
+  INSERT  channels                total=152000   distinct=331
+  UPDATE  sip_registrations       total=34011    distinct=3
+  ...
+top templates (limit 20):
+  1. count=40231    [DELETE] sip_registrations
+     delete from sip_registrations where sip_user = ? and hostname = ?
+  ...
+counters: templates=552/4096 (overflow 0) type-table=18/128 (overflow 0)
+```
+
+Интерпретация: отношение `total / distinct` на горячих таблицах — прямой
+прогноз выигрыша кэша трансляции (уровень модуля) и количества
+prepared-шаблонов при переходе на `IPROTO_PREPARE + bind` (уровень
+сервера). Отдельные литералы не раздувают distinct: нормализация
+маскирует строки (`'...'` → `?`, включая `''`), bare-числа (`123` → `?`),
+вырезает комментарии, приводит ключевые слова к нижнему регистру и
+схлопывает пробелы.
+
+Ограничения: 4096 шаблонов / 128 пар (тип × таблица) — сверх лимита
+переполнение суммируется в `overflow`-счётчики; статистика живёт в
+runtime и переживает `reload`, но сбрасывается при перезапуске модуля.
+
+### `cache` — кэш трансляции statement'ов (по нормализованному шаблону)
+
+Динамический, самонаполняющийся кэш с ключом-**шаблоном**: литералы данных
+(`'...'`, bare-числа) заменяются маркером, текст приводится к нижнему
+регистру и схлопнутым пробелам — ключ устойчив к разным значениям одного
+и того же statement (первый замер с raw-ключом показал hit-rate 4.19%:
+литералы uuid/статусы/таймстемпы почти всегда уникальны; нормализованный
+ключ — ~99% по данным `sqlstats`). В кэше хранится translated+quoted
+**шаблон**; на hit литералы конкретного вызова извлекаются из входа
+(`tnt_sql_templateize`) и подставляются в шаблон (`tnt_sql_rebuild`).
+
+Инвалидация — целиком на каждый `reload` правил (epoch-механизм, хендлы
+обновляются лениво). Statement'ы, чей rewrite зависит от значений
+литералов (intColumns CAST, `''`→NULL), literal core-UUID в pkadd-инъекции,
+`$${var}`-резолв — **не кэшируются** (`tnt_translate_ctx_t.ctx_dep`) и
+идут raw-путём. Safety-net: несовпадение числа маркеров после трансляции
+→ statement исполняется raw-путём и не сохраняется. Ограничения: 512
+записей (eviction least-hits), ≤ 8 КБ на statement, ≤ 32 литералов по
+512 байт.
+
+**Кэшируются только DML/SELECT** (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) —
+тот же критерий, что и для prepared statements. Стартовые DDL
+(`CREATE/DROP/ALTER`, ~70+ одноразовых шаблонов за прогрев sofia) не
+попадают в кэш: они исполняются один раз за жизнь процесса, и их записи с
+`hits=1` были бы балластом, портящим `cache show` и hit-rate. Это же
+критично для подготовленных statements (`box.prepare` не принимает DDL).
+
+```
+tarantool cache on | off | reset
+tarantool cache show [N] [full]   # сводка + топ-N по hits; full — весь текст
+```
+
+- `off` — обход кэша + очистка (kill-switch, применяется немедленно);
+- `reset` — очистка записей и счётчиков hits/misses;
+- параметр `<param name="cache"/>` в `<settings>` задаёт постоянную
+  конфигурацию (default `true`), применяется и через `reload`.
+
+Пример вывода `show`:
+
+```
+cache: enabled (limit 512, used 69)
+hit-rate: 8544/8613 = 99.20%
+misses since reset: 69
+total hits over entries: 8544
+top entries (by hits, limit 20):
+  1. hits=2848     len=214    age=112s 14:03:21
+      select call_id,sip_user,... from sip_registrations where force_ping= '0' ...
+```
+
+### `prepare` — подготовленные statements (IPROTO_PREPARE + bind)
+
+Этап 2 оптимизации. Кэшируемые шаблоны SELECT/INSERT/UPDATE/DELETE
+исполняются через `box.prepare`-эквивалент протокола: translated-шаблон с
+маркерами `\001` превращается в SQL с позиционными `'?'`-параметрами
+(`IPROTO_PREPARE = 0x0d`), литералы конкретного вызова кодируются в
+msgpack-bind (`IPROTO_SQL_BIND = 0x41`), исполнение — `IPROTO_EXECUTE (11)`
+с `IPROTO_STMT_ID = 0x43`. Экономится и клиентская работа (rebuild → bind),
+и серверная (парсинг/планирование SQL на каждый вызов).
+
+Ключевые инварианты:
+
+- **конфигурация — per-host**: `<param name="prepare"/>` задаётся на
+  `<profile>` (default для всех его хостов) и/или в `<host>` (переопределяет);
+  наследование профиль → хост, по умолчанию `false`;
+- **gate по РЕАЛЬНОЙ версии сервера**: версия берётся из greeting
+  (`"Tarantool X.Y.Z"`), а не из dial-атрибута `version` профиля —
+  `IPROTO_PREPARE` появился в 2.11, на серверах старше prepared-путь не
+  активируется вовсе (`prepare show` показывает `PREPARE unsupported`);
+- **`stmt_id` привязан к соединению** — prep-кэш (хэш переведённого шаблона
+  → `stmt_id`, FIFO-вытеснение, ≤ 128 записей) живёт в `tnt_conn_t` и
+  очищается при закрытии/переоткрытии соединения и при hot-reload правил
+  (переведённый текст шаблона меняется);
+- **прозрачный fallback**: любая ошибка prepare (DDL/PRAGMA не подготавливаются)
+  или execute (смена схемы инвалидирует statement) возвращает statement на
+  обычный путь — rebuild литералов + `IPROTO_EXECUTE` с текстом; 16 подряд
+  неудачных PREPARE отключают prepare до конца жизни соединения;
+- строки bind'ятся как `MP_STR`, целые — `MP_INT/MP_UINT`, прочие числа —
+  `MP_DOUBLE` (`tnt_bind_encode`, ≤ 32 значений по 512 байт).
+
+**SELECT-литералы (v1.0.7)**: Tarantool SQL не может вывести тип
+анонимного `'?'` в SELECT-списке — `PREPARE` падает с
+`Supplied key type of part N does not match index part type: expected ...`
+(типичный случай — автодополнение mod_sofia:
+`select distinct a2,?,? from complete where ...`). Решение: при записи в
+кэш трансляции флаг `literal` вычисляется один раз
+(`tnt_sql_has_select_markers` — есть ли маркеры до первого `FROM`); на
+prepare-пути такие литералы материализуются в константы
+(`tnt_sql_materialize_select`), а их значения изымаются из bind-массива.
+Итоговый prepared-SQL: константы в SELECT, `'?'` только в WHERE. Ключ
+кэша и prep-кэша остаются стабильными (маркеры везде), поэтому разные
+значения SELECT-констант не плодят записи. Ограничение эвристики: первый
+`FROM` вне строк/комментариев — подзапросы в WHERE с литералами в своём
+SELECT-списке не покрываются (на живом трафике не встречаются).
+
+```
+tarantool prepare on | off | reset
+tarantool prepare show
+# profile 'local': prepare on 1/1 host(s)
+# conn 'local': prepare allowed, server 3.2, PREPARE ok
+# prepares: 74  execs: 8421  prep-cache hits: 8347 (99.12%)  fallbacks: 12  errors: 0
+```
+
+- `on`/`off` — runtime-override для всех живых соединений; при
+  переподключении возвращается конфиг хоста (`tnt_conn_init`);
+- `reset` — обнулить счётчики;
+- `show` — конфиг по профилям, состояние живых conn (разрешено/реальная
+  версия сервера) и счётчики: `prepares` — отправленные IPROTO_PREPARE,
+  `execs` — исполнено prepared-путём, `prep-cache hits` — попадания в
+  per-conn stmt_id-кэш, `fallbacks` — уходы на обычный путь, `errors` —
+  отказы сервера.
+
+**Диагностика fallback**: при `tarantool debug on` каждый fallback
+логируется с причиной и шаблоном:
+`prepare fallback (sql-error: <текст ошибки>): [<шаблон с '?'>]`.
+Причины: `no-connection`, `prepare-broken`, `prepare-disabled`,
+`prepare-unsupported`, `oom:qsql`/`oom:bind`, `prepare-rejected`,
+`sql-error` (в т.ч. инвалидация prepared при смене схемы — самый частый
+случай на живом трафике), `transport`.
+
+---
+
+## Пул соединений (`pool-size`)
+
+Каждый handle (`tarantool://<profile>`) держит **`pool-size` независимых
+соединений** (1..8, по умолчанию 1) и распределяет statement'ы между ними
+**round-robin**. У каждого соединения — свой failover-цикл, свой
+prepared-statement кэш (`stmt_id` привязан к соединению) и свой
+per-connection мьютекс: statement'ы на **разных** соединениях выполняются
+параллельно, на одном — сериализуются. `pool-size=1` полностью повторяет
+классическое поведение «один handle — одно соединение».
+
+Ключевые свойства:
+
+- **Параллельность**: `h->lock` больше не держится на время SQL-вызова —
+  он используется только для коротких критических секций (выбор
+  соединения, закрепление транзакции, первый callsite, CLI). Выполнение
+  сериализует per-connection мьютекс, поэтому `pool-size>1` размазывает
+  конкурентные запросы по нескольким соединениям.
+- **Транзакции**: `set_auto_commit(false)` закрепляет текущее соединение
+  за handle'ом (`[tx]` в `tarantool conns`); все statement'ы транзакции
+  идут на него, а остальные вызовы при `pool-size>1` обходят закреплённое
+  соединение. `commit`/`rollback` снимают закрепление.
+- **Failover ×N**: каждая сессия пула независимо выбирает хост и
+  переподключается; при `pool-size>1` отказ одного соединения не
+  блокирует остальные.
+- **Prepared statements**: per-conn кэш уже был спроектирован под пул —
+  `stmt_id` привязан к соединению, при reconnect кэш сбрасывается
+  (`tnt_conn_init`), при reload правил сбрасываются все соединения пула.
+- **Правила трансляции (immutable snapshot)**: reload создаёт новую копию
+  `tnt_rules_t` и атомарно подменяет указатель; старый снапшот уходит в
+  grace-список и освобождается через 60 с (in-flight statement'ы могут
+  ещё читать его без блокировок). Трансляция на разных соединениях идёт
+  параллельно.
+- **Частичный пул**: если при создании handle'а не удалось открыть
+  соединение `k>0`, пул ужимается до `k` (лог warning); если не открылось
+  первое — handle не создаётся.
+
+Диагностика: `tarantool conns [profile]` показывает каждое соединение
+пула (`conn=N/M`, `[tx]` для закреплённого), `tarantool prepare show` —
+состояние PREPARE по каждому соединению, `tarantool list` — `pool-size`
+профиля.
+
+### `pool-size` и число хостов — ортогональные оси
+
+**`pool-size` НЕ связан с количеством хостов в `<profile>`.** Это две
+независимые оси:
+
+- **`<hosts>` — failover-список**: упорядоченные *альтернативы*, из
+  которых каждая сессия выбирает **один** живой хост (master + реплики
+  на случай отказа). Это не «одновременные соединения».
+- **`pool-size` — параллельные соединения на один handle**: каждое
+  соединение пула **само по себе** проходит failover по всему списку
+  хостов.
+
+Поэтому `pool-size = nhosts` **не распределяет** соединения по хостам:
+все сессии пула стартуют с первого хоста списка и при живом master'е
+подключатся к нему (реплики останутся неиспользованными, а на master'е
+появятся лишние сокеты + файберы + prep-кэши). Распределение нагрузки
+по репликам (SELECT → replica, write → master) — отдельная фича
+role-aware routing (атрибут `role` в v1 игнорируется).
+
+### Что реально определяет `pool-size`
+
+| Фактор | Влияние |
+|---|---|
+| Параллельность запросов через один handle | Сколько потоков FreeSWITCH одновременно шлют SQL (RPS × RTT) |
+| RTT до Tarantool | При RTT ~1 мс одно соединение пропускает ~1000 запросов/с; больше соединений — больше пропускная способность |
+| Ресурсы | Каждый conn = сокет + файбер на сервере + prep-кэш (128 записей); при 256 хендлах × 8 conn = 2048 сокетов — перебор |
+| Топология хостов | **Не влияет** — failover-список обслуживается каждой сессией пула независимо |
+
+### Рекомендация инсталятору
+
+- **Оставить `pool-size=1`** (безопасный дефолт, классическое поведение
+  «один handle — одно соединение»).
+- Если нужен «разумный дефолт под нагрузку» — **2–4**, но это параметр
+  производительности, который подбирается по замерам (RPS, RTT), а не по
+  числу хостов.
+- **Не выводить `pool-size` из `nhosts`**: при 3–4 хостах в failover-
+  списке инсталятор молча создаст 3–4 соединения к одному master'у —
+  лишние ресурсы без выигрыша.
+
+---
+
+## Circuit breaker (`cb-mode`)
+
+Shared circuit breaker защищает FreeSWITCH от «плотного» цикла ошибок,
+когда Tarantool-хост умирает: ядро (`switch_cache_db_test_reactive`)
+делает быстрый тестовый запрос, и если драйвер мгновенно возвращает
+`FAIL`, ядро считает таблицы отсутствующими, пытается их создать, снова
+получает мгновенный отказ и уходит в бесконечный цикл (CPU 100%).
+
+### Машина состояний (per-host, ключ `addr:port`)
+
+```
+CLOSED ──(threshold транспортных отказов)──▶ OPEN ──(cb-timeout)──▶ HALF_OPEN
+  ▲                                                                    │
+  └──────────────(probe успешен)──────────────────────────────────────┘
+  OPEN ◀──(probe провален: новое окно cb-timeout)── HALF_OPEN
+```
+
+- **CLOSED** — хост здоров, все запросы идут в сеть. Каждый транспортный
+  отказ (connect, обрыв, PING/pre-read fail) увеличивает счётчик; при
+  `cb-failure-threshold` (по умолчанию 3) breaker открывается. Счётчик
+  общий для всех сессий/пулов, поэтому «волна» отказов пула = одно
+  открытие, а не N.
+- **OPEN** — запросы не ходят в сеть:
+  - `cb-mode=wait` — поток спит до конца окна (сон ограничен
+    `query-timeout`), затем повторно проверяет состояние и, если окно
+    истекло, борется за право стать probe;
+  - `cb-mode=fast` — мгновенная ошибка `circuit breaker OPEN (fail-fast)`.
+- **HALF_OPEN** — ровно один поток («первый победил») делает реальный
+  `connect()`; остальные ждут. Успех → `CLOSED` (все ждущие просыпаются),
+  провал → снова `OPEN` на `cb-timeout`.
+
+### Режимы
+
+| `cb-mode` | Поведение при OPEN | Когда использовать |
+|---|---|---|
+| `off` | классический per-conn экспоненциальный backoff (v1.0.5) | поведение по умолчанию; совместимость |
+| `wait` | запросы спят до конца окна, затем probe | **рекомендуется**: безопасно для `switch_cache_db_test_reactive`, сеть не долбится (1 connect за окно) |
+| `fast` | мгновенный отказ | только если ядро/приложение корректно обрабатывают мгновенный FAIL (иначе CPU-цикл) |
+
+### Особенности
+
+- **Per-host, не per-profile**: два профиля на один `addr:port` делят один
+  breaker; состояние живёт в глобальном реестре модуля.
+- **Замена backoff**: при `cb-mode != off` per-conn `dead_until_host[]`/
+  `backoff_host[]` не используются — их роль выполняет breaker.
+- **Живые соединения не гейтятся**: breaker вмешивается только в
+  `connect()`/открытие сессии и учитывает транспортные отказы; уже
+  установленные соединения работают без проверок.
+- **Writes при OPEN** (`fast`) возвращают ошибку без ретрая — retryable
+  только SELECT/BEGIN (защита от дублей).
+- **Reload** обновляет `cb-mode`/`cb-failure-threshold`/`cb-timeout` hot,
+  не сбрасывая состояние и счётчики; `tarantool cb reset` сбрасывает
+  состояние и счётчики вручную.
+- **Single-host профиль + `wait`**: единственный хост в OPEN — запросы
+  спят до конца окна (≤ `query-timeout`), затем один probe; частота
+  реальных connect'ов ≈ 1 за `cb-timeout`. Это «имитация зависания» БД
+  для ядра — безопаснее, чем мгновенный FAIL.
+
+### CLI
+
+```
+tarantool cb show    # режим, порог, окно + таблица по хостам:
+                     #   state, fails, open_until, probing,
+                     #   opens / fail_fast / probes / successes
+tarantool cb reset   # все breaker'ы в CLOSED, счётчики обнулены
+```
+
+Пример вывода:
+
+```
+circuit breaker: mode=wait threshold=3 timeout=5000ms hosts=1
+  127.0.0.1:3301            state=open     fails=3 open_until=1750000000000 probing=0 opens=1 fail_fast=42 probes=1 successes=0
+```
+
+### Конфигурация (`<settings>`)
+
+```xml
+<param name="cb-mode" value="wait"/>
+<param name="cb-failure-threshold" value="3"/>
+<param name="cb-timeout" value="5000"/>
 ```
 
 ---
@@ -743,6 +1165,27 @@ mod_tarantool[debug] profile=local out sofia_reg.c:2578 sofia_reg_handle_sip_r_r
 - **Full table scan запрещён по умолчанию**: `SELECT * FROM t` падает
   (`Scanning is not allowed`); нужен `FROM SEQSCAN t`. Модуль включает
   `SET SESSION sql_full_scan=true` на соединение (см. параметр full-scan).
+- **Транзакции привязаны к файберу** (важно для будущей фазы
+  "IPROTO streams для DML-батчей"): последовательно отправленные запросы
+  без стрима сервер выполняет в **разных файберах**, поэтому `COMMIT`
+  вернёт ошибку `no transaction is active`. Транзакционный батч требует
+  отправки **отдельных сетевых пакетов** `IPROTO_EXECUTE` с одним и тем же
+  ненулевым `IPROTO_STREAM_ID` в заголовке каждого пакета — тогда сервер
+  привязывает их к одному файберу и транзакция становится сквозной:
+
+  ```
+  Пакет 1: START TRANSACTION;  (или BEGIN;)
+  Пакет 2: INSERT INTO users VALUES (1, 'Ivan');   -- stmt1
+  Пакет 3: INSERT INTO users VALUES (2, 'etc');    -- stmt2
+  Пакет 4: COMMIT;
+  ```
+
+  Мульти-statement в одном `IPROTO_EXECUTE` Tarantool не поддерживает, а
+  анонимные блоки `BEGIN … END` не являются документированной SQL-формой —
+  поэтому батч-транзакционность реализуется только через streams. При этом
+  DDL в стрим не заворачивается (DDL в Tarantool не транзакционен), а при
+  таймауте внутри стрима обязателен явный `ROLLBACK` в том же стриме —
+  сервер сам его не делает.
 
 ---
 

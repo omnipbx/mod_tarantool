@@ -1,52 +1,52 @@
 /*
-* mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ * mod_tarantool for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2026, Filippov Anatoliy <error.email@mail.ru>
-*
-* Version: MPL 2.0
-*
-* The contents of this file are subject to the Mozilla Public License Version
-* 1.1 (the "License"); you may not use this file except in compliance with
-* the License. You may obtain a copy of the License at
-* http://www.mozilla.org/MPL/
-*
-* Software distributed under the License is distributed on an "AS IS" basis,
-* WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
-* for the specific language governing rights and limitations under the
-* License.
-*
-* The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
-*
-* The Initial Developer of the Original Code is
-* Anthony Minessale II <anthm@freeswitch.org>
-* Portions created by the Initial Developer are Copyright (C)
-* the Initial Developer. All Rights Reserved.
-*
-* Contributor(s):
-* Filippov Anatoliy <error.email@mail.ru>
-*
-* tnt_rules.h -- declarative DDL translation rules.
-*
-* The FreeSWITCH core and mod_sofia issue SQLite-flavoured DDL that
-* Tarantool's SQL dialect cannot execute verbatim. This module translates
-* each statement based on static rules from tarantool.conf.xml:
-*
-*   - <primaryKey table field>    mark an EXISTING column as PRIMARY KEY
-*   - <primaryKeyAdd table field> add "field UUID NOT NULL DEFAULT <gen>"
-*                                  and make it the PRIMARY KEY
-*   - <addField table field type isNull default> add an arbitrary column
-*   - <reserved name>             extend the list of words the SQL rewriter
-*                                  double-quotes ("uuid", "alias" are built in)
-*   - <views><view name CDATA>    declare SELECT bodies that substitute the
-*                                  missing Tarantool VIEW: every core SELECT
-*                                  with "FROM <name>" is rewritten into
-*                                  "FROM (<body>) AS <name>"
-*   - BIGINT -> INTEGER           (Tarantool has only INTEGER)
-*   - CREATE VIEW                 -> no-op (logged by the caller)
-*   - IF NOT EXISTS / IF EXISTS   removed (Tarantool rejects them)
-*   - CREATE INDEX                -> IF NOT EXISTS form
-*   - benign errors               mapped by tnt_rules_is_benign_error()
-*
-*/
+ *
+ * Version: MPL 2.0
+ *
+ * The contents of this file are subject to the Mozilla Public License Version
+ * 2.0 (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ * http://www.mozilla.org/MPL/
+ *
+ * Software distributed under the License is distributed on an "AS IS" basis,
+ * WITHOUT WARRANTY OF ANY KIND, either express or implied. See the License
+ * for the specific language governing rights and limitations under the
+ * License.
+ *
+ * The Original Code is FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
+ *
+ * The Initial Developer of the Original Code is
+ * Anthony Minessale II <anthm@freeswitch.org>
+ * Portions created by the Initial Developer are Copyright (C)
+ * the Initial Developer. All Rights Reserved.
+ *
+ * Contributor(s):
+ * Filippov Anatoliy <error.email@mail.ru>
+ *
+ * tnt_rules.h -- declarative DDL translation rules.
+ *
+ * The FreeSWITCH core and mod_sofia issue SQLite-flavoured DDL that
+ * Tarantool's SQL dialect cannot execute verbatim. This module translates
+ * each statement based on static rules from tarantool.conf.xml:
+ *
+ *   - <primaryKey table field>    mark an EXISTING column as PRIMARY KEY
+ *   - <primaryKeyAdd table field> add "field UUID NOT NULL DEFAULT <gen>"
+ *                                  and make it the PRIMARY KEY
+ *   - <addField table field type isNull default> add an arbitrary column
+ *   - <reserved name>             extend the list of words the SQL rewriter
+ *                                  double-quotes ("uuid", "alias" are built in)
+ *   - <views><view name CDATA>    declare SELECT bodies that substitute the
+ *                                  missing Tarantool VIEW: every core SELECT
+ *                                  with "FROM <name>" is rewritten into
+ *                                  "FROM (<body>) AS <name>"
+ *   - BIGINT -> INTEGER           (Tarantool has only INTEGER)
+ *   - CREATE VIEW                 -> no-op (logged by the caller)
+ *   - IF NOT EXISTS / IF EXISTS   removed (Tarantool rejects them)
+ *   - CREATE INDEX                -> IF NOT EXISTS form
+ *   - benign errors               mapped by tnt_rules_is_benign_error()
+ *
+ */
 
 #ifndef TNT_RULES_H
 #define TNT_RULES_H
@@ -143,6 +143,13 @@ typedef struct tnt_translate_ctx {
 	const char *core_uuid;		/* pre-generated UUIDv7 string, or NULL */
 	tnt_var_resolver_t resolver;	/* runtime $${var} lookup, or NULL */
 	void *ud;
+	int ctx_dep;				/* set by the translator when the RESULT of
+								 * this statement depends on the per-call
+								 * context: a literal core UUID was injected
+								 * (pkadd core-uuid=true) or a $${var} was
+								 * resolved. Such statements must NOT be
+								 * stored in the translate cache. Callers
+								 * memset() the whole ctx to 0. */
 } tnt_translate_ctx_t;
 
 SWITCH_DECLARE(void) tnt_rules_init(tnt_rules_t *r);
@@ -187,7 +194,7 @@ SWITCH_DECLARE(const char *) tnt_intcol_cast_for_type(const char *type);
  * the core-generated UUIDv7 and the runtime variable resolver for INSERT
  * injections (may be NULL). */
 SWITCH_DECLARE(char *) tnt_rules_translate(const tnt_rules_t *r, const tnt_stmt_t *st,
-										   int server_major, const tnt_translate_ctx_t *ctx,
+										   int server_major, tnt_translate_ctx_t *ctx,
 										   int *is_noop);
 
 /* 1 if the server error should be treated as SUCCESS, 0 otherwise.
