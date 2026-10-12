@@ -1103,3 +1103,190 @@ SWITCH_DECLARE(int) tnt_sql_materialize_select(const char *tpl, tnt_sql_val_t *v
 	}
 	return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* SEQSCAN injection (full-scan workaround for forks without the        */
+/* sql_full_scan session variable)                                      */
+/* ------------------------------------------------------------------ */
+
+#define SEQ_PUT(c) do { \
+		if (n + 1 >= cap) \
+			return -1; \
+		out[n++] = (c); \
+	} while (0)
+
+/* 1 when the identifier at sql[q] is the SEQSCAN keyword (case-insensitive,
+ * word-bounded), 0 otherwise. Used to avoid double injection. */
+static int seqscan_at(const char *sql, size_t q, size_t len)
+{
+	if (q + 6 >= len)
+		return 0;
+	if (!((sql[q] == 's' || sql[q] == 'S') &&
+		  (sql[q + 1] == 'e' || sql[q + 1] == 'E') &&
+		  (sql[q + 2] == 'q' || sql[q + 2] == 'Q') &&
+		  (sql[q + 3] == 's' || sql[q + 3] == 'S') &&
+		  (sql[q + 4] == 'c' || sql[q + 4] == 'C') &&
+		  (sql[q + 5] == 'a' || sql[q + 5] == 'A') &&
+		  (sql[q + 6] == 'n' || sql[q + 6] == 'N')))
+		return 0;
+	return (q + 7 == len || !is_ident_char(sql[q + 7]));
+}
+
+SWITCH_DECLARE(int) tnt_sql_inject_seqscan(const char *sql, char *out, size_t cap)
+{
+	enum { S_NORM, S_SQ, S_DQ, S_LC, S_BC } st = S_NORM;
+	size_t p = 0, n = 0, len = strlen(sql);
+	int depth = 0;
+	int top_select = 0;
+
+	if (!sql || !out || cap == 0)
+		return -1;
+
+	/* top-level SELECT? (only such statements get SEQSCAN at depth 0) */
+	{
+		size_t k = 0;
+
+		while (k < len && isspace((unsigned char)sql[k]))
+			k++;
+		if (len - k >= 6 &&
+			!strncasecmp(sql + k, "select", 6) &&
+			(k + 6 == len || !is_ident_char(sql[k + 6])))
+			top_select = 1;
+	}
+
+	while (p < len) {
+		char c = sql[p];
+
+		switch (st) {
+		case S_NORM:
+			if (c == '\'') {
+				st = S_SQ;
+				SEQ_PUT(c);
+			} else if (c == '"') {
+				st = S_DQ;
+				SEQ_PUT(c);
+			} else if (c == '-' && p + 1 < len && sql[p + 1] == '-') {
+				st = S_LC;
+				SEQ_PUT(c);
+				SEQ_PUT(sql[p + 1]);
+				p++;
+			} else if (c == '/' && p + 1 < len && sql[p + 1] == '*') {
+				st = S_BC;
+				SEQ_PUT(c);
+				SEQ_PUT(sql[p + 1]);
+				p++;
+			} else if (c == '(') {
+				depth++;
+				SEQ_PUT(c);
+			} else if (c == ')') {
+				if (depth > 0)
+					depth--;
+				SEQ_PUT(c);
+			} else if ((c == 'f' || c == 'F') && (top_select || depth > 0) &&
+					   (p == 0 || !is_ident_char(sql[p - 1])) &&
+					   p + 4 <= len &&
+					   (sql[p + 1] == 'r' || sql[p + 1] == 'R') &&
+					   (sql[p + 2] == 'o' || sql[p + 2] == 'O') &&
+					   (sql[p + 3] == 'm' || sql[p + 3] == 'M') &&
+					   (p + 4 == len || !is_ident_char(sql[p + 4]))) {
+				/* FROM keyword: copy it (original case), then inject
+				 * SEQSCAN before the table name (unless it is a subquery
+				 * "FROM (") */
+				SEQ_PUT(sql[p]);
+				SEQ_PUT(sql[p + 1]);
+				SEQ_PUT(sql[p + 2]);
+				SEQ_PUT(sql[p + 3]);
+				p += 3;
+				{
+					size_t q = p + 1;
+
+					while (q < len && isspace((unsigned char)sql[q]))
+						q++;
+					if (q < len && sql[q] != '(' && !seqscan_at(sql, q, len)) {
+						SEQ_PUT(' ');
+						SEQ_PUT('S');
+						SEQ_PUT('E');
+						SEQ_PUT('Q');
+						SEQ_PUT('S');
+						SEQ_PUT('C');
+						SEQ_PUT('A');
+						SEQ_PUT('N');
+					}
+				}
+			} else if ((c == 'j' || c == 'J') && (top_select || depth > 0) &&
+					   (p == 0 || !is_ident_char(sql[p - 1])) &&
+					   p + 4 <= len &&
+					   (sql[p + 1] == 'o' || sql[p + 1] == 'O') &&
+					   (sql[p + 2] == 'i' || sql[p + 2] == 'I') &&
+					   (sql[p + 3] == 'n' || sql[p + 3] == 'N') &&
+					   (p + 4 == len || !is_ident_char(sql[p + 4]))) {
+				/* JOIN keyword: copy it (original case), then inject
+				 * SEQSCAN before the table name */
+				SEQ_PUT(sql[p]);
+				SEQ_PUT(sql[p + 1]);
+				SEQ_PUT(sql[p + 2]);
+				SEQ_PUT(sql[p + 3]);
+				p += 3;
+				{
+					size_t q = p + 1;
+
+					while (q < len && isspace((unsigned char)sql[q]))
+						q++;
+					if (q < len && sql[q] != '(' && !seqscan_at(sql, q, len)) {
+						SEQ_PUT(' ');
+						SEQ_PUT('S');
+						SEQ_PUT('E');
+						SEQ_PUT('Q');
+						SEQ_PUT('S');
+						SEQ_PUT('C');
+						SEQ_PUT('A');
+						SEQ_PUT('N');
+					}
+				}
+			} else {
+				SEQ_PUT(c);
+			}
+			break;
+		case S_SQ:
+			SEQ_PUT(c);
+			if (c == '\'') {
+				if (p + 1 < len && sql[p + 1] == '\'') {
+					SEQ_PUT(sql[p + 1]);
+					p++;
+				} else {
+					st = S_NORM;
+				}
+			}
+			break;
+		case S_DQ:
+			SEQ_PUT(c);
+			if (c == '"') {
+				if (p + 1 < len && sql[p + 1] == '"') {
+					SEQ_PUT(sql[p + 1]);
+					p++;
+				} else {
+					st = S_NORM;
+				}
+			}
+			break;
+		case S_LC:
+			SEQ_PUT(c);
+			if (c == '\n')
+				st = S_NORM;
+			break;
+		case S_BC:
+			SEQ_PUT(c);
+			if (c == '*' && p + 1 < len && sql[p + 1] == '/') {
+				SEQ_PUT(sql[p + 1]);
+				p++;
+				st = S_NORM;
+			}
+			break;
+		}
+		p++;
+	}
+	out[n] = '\0';
+	return 0;
+}
+
+#undef SEQ_PUT

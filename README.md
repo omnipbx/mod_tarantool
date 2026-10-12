@@ -14,7 +14,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.7)
+## Возможности (v1.0.8)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -41,13 +41,13 @@ PostgreSQL.
 - **Батч-запросы**: SQL вида `stmt1;stmt2;...` (типично для mod_sofia)
   разбивается корректным сплиттером (строки `''`, комментарии, скобки) и
   выполняется последовательно.
-- **Транзакционность батчей** *(в разработке, v1.0.4)*: DML-батчи будут
-  выполняться атомарно через IPROTO streams — отдельные пакеты
-  `IPROTO_EXECUTE` с общим ненулевым `IPROTO_STREAM_ID` (сервер привязывает
-  их к одному файберу, транзакция `BEGIN; stmt1; …; COMMIT;` становится
-  сквозной; при разрыве связи сервер откатывает её сам, при таймауте модуль
-  шлёт явный `ROLLBACK` в том же стриме). DDL-батчи остаются вне стрима —
-  DDL в Tarantool не транзакционен. Требование сервера: Tarantool ≥2.11
+- **Транзакционность батчей**: DML-батчи выполняются атомарно
+  через IPROTO streams — отдельные пакеты `IPROTO_EXECUTE` с общим
+  ненулевым `IPROTO_STREAM_ID` (сервер привязывает их к одному файберу,
+  транзакция `BEGIN; stmt1; …; COMMIT;` становится сквозной; при разрыве
+  связи сервер откатывает её сам, при таймауте модуль шлёт явный
+  `ROLLBACK` в том же стриме). DDL-батчи остаются вне стрима — DDL в
+  Tarantool не транзакционен. Требование сервера: Tarantool ≥2.11
   (у 3.x — есть). См. «Особенности протокола, учтённые в реализации».
 - **Мультипоточность**: соединение на (поток × callsite); каждый
   `handle_new` создаёт глубокую копию профиля+правил, поэтому reload
@@ -70,6 +70,15 @@ PostgreSQL.
   записи); перед `IPROTO_PREPARE` такие литералы материализуются в
   константы, а их значения изымаются из bind-массива. Ключ кэша остаётся
   стабильным (маркеры везде) — раздувания `cache` нет.
+- **SEQSCAN-инъекция** (`full-scan`, v1.0.8): форк Tarantool 3.8 не знает
+  сессионную переменную `sql_full_scan` (`Session setting sql_full_scan
+  doesn't exist`), поэтому `SET SESSION` молча не срабатывает и полные
+  сканы запрещены. При `full-scan="true"` на профиле модуль вставляет
+  `SEQSCAN` перед именами таблиц в `FROM`/`JOIN` (в т.ч. в подзапросах
+  DML: `DELETE ... IN (SELECT ... FROM t1 JOIN t2 ...)`) — на всех путях
+  исполнения (ядро, `<maintenance>`, `tarantool sql`) и в `tarantool
+  translate`. `DELETE FROM t` без подзапроса не трогается, уже
+  присутствующий `SEQSCAN` не дублируется.
 - **CLI API**: команда `tarantool` в fs_cli.
 
 ---
@@ -270,7 +279,7 @@ Tarantool: `2.10` или `3.2`) и `skip-index` (игнорирование inde
 
 | Параметр | Описание |
 |---|---|
-| `full-scan` | `true` (по умолчанию) — на каждом новом соединении к любому хосту профиля выполняется `SET SESSION sql_full_scan=true` (Tarantool 2.11/3.x), при неизвестной переменной — фолбэк `SET SESSION sql_seq_scan=true` (старые 2.x); `false` — не включать. Без этого ядро FreeSWITCH не сможет выполнять полные сканы (реактивные probe-запросы) — каждый старт заканчивается DROP+CREATE всех таблиц |
+| `full-scan` | `true` (по умолчанию) — на каждом новом соединении к любому хосту профиля выполняется `SET SESSION sql_full_scan=true` (Tarantool 2.11/3.x), при неизвестной переменной — фолбэк `SET SESSION sql_seq_scan=true` (старые 2.x); `false` — не включать. **v1.0.8**: при `true` модуль дополнительно вставляет `SEQSCAN` перед таблицами в `FROM`/`JOIN` (в т.ч. в подзапросах DML) на всех путях исполнения — это единственный надёжный способ на форках, не знающих `sql_full_scan` (node01: `Session setting sql_full_scan doesn't exist`). Без этого ядро FreeSWITCH не сможет выполнять полные сканы (реактивные probe-запросы) — каждый старт заканчивается DROP+CREATE всех таблиц |
 | `init-sql` | произвольный SQL, выполняемый сразу после успешного connect к любому хосту профиля (и после каждого failover-переподключения); ошибка «неизвестная переменная» — benign, остальные логируются warning без обрыва соединения |
 | `pool-size` | размер пула соединений на один handle (1..8, по умолчанию 1). Каждый handle держит до `pool-size` независимых соединений (у каждого — свой failover-цикл и свой кэш prepared statements) и распределяет statement'ы round-robin. `1` = классическое «один handle — одно соединение»; `>1` позволяет параллельно выполнять statement'ы на разных соединениях (см. раздел [«Пул соединений»](#пул-соединений-pool-size)) |
 
@@ -732,7 +741,10 @@ tarantool conns [profile]     # активные соединения и их и
 tarantool ping [profile]      # ping пула — первый доступный хост (по умолчанию local)
 tarantool check [profile]     # ping каждого хоста профиля по отдельности
 tarantool sql <profile> <q>   # выполнить сырой SQL-запрос
-tarantool translate <q>       # показать результат трансляции DDL
+tarantool translate [<profile>] <q>  # показать результат трансляции DDL
+                                     # (профиль опционально: если первый
+                                     #  токен совпадает с именем профиля;
+                                     #  иначе — первый профиль в конфиге)
 tarantool sqlstats on|off|reset|tables|show   # статистика SQL-шаблонов
 tarantool cache on|off|reset|show [N] [full]  # кэш трансляции
 tarantool prepare on|off|reset|show           # подготовленные statements
@@ -749,6 +761,7 @@ tarantool ping local
 tarantool check local
 tarantool sql local "select * from channels limit 1"
 tarantool translate "create table channels (uuid varchar(255), name varchar(255))"
+tarantool translate local "delete from sip_subscriptions where sip_subscriptions_uuid in (select s.sip_subscriptions_uuid from sip_subscriptions s left join sip_registrations r on s.sip_user = r.sip_user where r.sip_user is null)"
 ```
 
 Пример вывода `check` для профиля с двумя хостами:
@@ -1164,7 +1177,10 @@ circuit breaker: mode=wait threshold=3 timeout=5000ms hosts=1
   стандартного `INTERVAL '1' DAY` нет.
 - **Full table scan запрещён по умолчанию**: `SELECT * FROM t` падает
   (`Scanning is not allowed`); нужен `FROM SEQSCAN t`. Модуль включает
-  `SET SESSION sql_full_scan=true` на соединение (см. параметр full-scan).
+  `SET SESSION sql_full_scan=true` на соединение (см. параметр full-scan),
+  а при `full-scan="true"` (v1.0.8) дополнительно вставляет `SEQSCAN`
+  перед таблицами в `FROM`/`JOIN` — на форках без `sql_full_scan`
+  (node01) это единственный способ разрешить скан.
 - **Транзакции привязаны к файберу** (важно для будущей фазы
   "IPROTO streams для DML-батчей"): последовательно отправленные запросы
   без стрима сервер выполняет в **разных файберах**, поэтому `COMMIT`

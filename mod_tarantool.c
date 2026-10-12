@@ -89,7 +89,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.7"
+#define TNT_VERSION	"1.0.8"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -2012,6 +2012,20 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 					tnt_sql_quote_reserved(pre, nb, ncap, words, nwords);
 					free(pre);
 					out = nb;
+					/* full-scan profile: make scans explicit (the fork has
+					 * no sql_full_scan session variable, so FROM SEQSCAN t
+					 * is the only reliable way to allow a scan) */
+					if (h->profile.full_scan) {
+						size_t ncap2 = strlen(out) * 2 + 64;
+						char *nb2 = (char *)malloc(ncap2);
+
+						if (nb2 && tnt_sql_inject_seqscan(out, nb2, ncap2) == 0) {
+							free(out);
+							out = nb2;
+						} else {
+							free(nb2);
+						}
+					}
 				}
 
 				if (tpl_in && !ctx.ctx_dep && prepable) {
@@ -2081,6 +2095,17 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 							tnt_sql_quote_reserved(out, nb, ncap, words, nwords);
 							free(out);
 							out = nb;
+							if (h->profile.full_scan) {
+								size_t ncap2 = strlen(out) * 2 + 64;
+								char *nb2 = (char *)malloc(ncap2);
+
+								if (nb2 && tnt_sql_inject_seqscan(out, nb2, ncap2) == 0) {
+									free(out);
+									out = nb2;
+								} else {
+									free(nb2);
+								}
+							}
 						}
 					}
 				}
@@ -2474,38 +2499,45 @@ static void tnt_fmt_age(int64_t sec, char *buf, size_t cap)
 		snprintf(buf, cap, "%" PRId64 "s", s);
 }
 
-/* Join argv[start..argc-1] into a single malloc'ed SQL string, separating
-	* tokens with single spaces (the API parser splits the command line on
-	* whitespace, so a query with spaces arrives as several argv entries).
-	* Strips one pair of matching surrounding double quotes if present (users
-	* commonly quote the query). Returns NULL if there are no tokens. */
-static char *api_join_query(char **argv, int start, int argc)
+/* Return the command tail after the first nwords whitespace-separated
+ * words, or NULL when the command has fewer words. The tail is a pointer
+ * into cmd (the caller copies it if needed). Used by the sql/translate
+ * subcommands: rejoining strtok'd argv is capped at 15 tokens and loses
+ * quotes/spaces, which truncates long statements (e.g. JOIN subqueries). */
+static const char *api_cmd_tail(const char *cmd, int nwords)
 {
-	char *out;
-	char *w;
+	const char *p = cmd;
 	int i;
+
+	if (!cmd)
+		return NULL;
+	for (i = 0; i < nwords; i++) {
+		while (*p && isspace((unsigned char)*p))
+			p++;
+		if (!*p)
+			return NULL;
+		while (*p && !isspace((unsigned char)*p))
+			p++;
+	}
+	while (*p && isspace((unsigned char)*p))
+		p++;
+	return *p ? p : NULL;
+}
+
+/* Copy the first whitespace-separated word of s into buf (cap bytes incl.
+ * NUL). Returns buf on success, NULL when s is empty/whitespace-only. */
+static const char *api_first_word(const char *s, char *buf, size_t cap)
+{
 	size_t n = 0;
 
-	if (start >= argc)
+	if (!s || cap == 0)
 		return NULL;
-	for (i = start; i < argc; i++)
-		n += strlen(argv[i]) + 1;
-	out = (char *)malloc(n + 1);
-	if (!out)
-		return NULL;
-	w = out;
-	for (i = start; i < argc; i++) {
-		if (i > start)
-			*w++ = ' ';
-		w += sprintf(w, "%s", argv[i]);
-	}
-	*w = '\0';
-	n = strlen(out);
-	if (n >= 2 && out[0] == '"' && out[n - 1] == '"') {
-		memmove(out, out + 1, n - 2);
-		out[n - 2] = '\0';
-	}
-	return out;
+	while (*s && isspace((unsigned char)*s))
+		s++;
+	while (*s && !isspace((unsigned char)*s) && n + 1 < cap)
+		buf[n++] = *s++;
+	buf[n] = '\0';
+	return n ? buf : NULL;
 }
 
 SWITCH_STANDARD_API(api_tarantool)
@@ -2999,9 +3031,15 @@ SWITCH_STANDARD_API(api_tarantool)
 		tnt_session_t s;
 		tnt_result_t res;
 		int rc, r;
+		const char *qtail = api_cmd_tail(cmd, 2);
 
-		if (!(q = api_join_query(argv, 2, argc))) {
+		if (!qtail) {
 			stream->write_function(stream, "usage: tarantool sql <profile> <query>\n");
+			goto out;
+		}
+		q = strdup(qtail);
+		if (!q) {
+			stream->write_function(stream, "out of memory\n");
 			goto out;
 		}
 		switch_mutex_lock(glob->mutex);
@@ -3036,6 +3074,19 @@ SWITCH_STANDARD_API(api_tarantool)
 				q = nq;
 			}
 		}
+		/* full-scan profile: make scans explicit (the fork has no
+		 * sql_full_scan session variable, so FROM SEQSCAN t is required) */
+		if (prof.full_scan) {
+			size_t ncap = strlen(q) * 2 + 64;
+			char *nq = (char *)malloc(ncap);
+
+			if (nq && tnt_sql_inject_seqscan(q, nq, ncap) == 0) {
+				free(q);
+				q = nq;
+			} else {
+				free(nq);
+			}
+		}
 		rc = tnt_session_execute(&s, q, 1, &res);
 		if (rc != 0) {
 			stream->write_function(stream, "error: %s\n", res.error[0] ? res.error : "unknown");
@@ -3055,15 +3106,54 @@ SWITCH_STANDARD_API(api_tarantool)
 		tnt_session_close(&s);
 	} else if (!strcasecmp(sub, "translate")) {
 		char *q = NULL;
+		char pname[64] = "";
+		int full_scan = 0;
 		tnt_stmt_t stmts[TNT_SQL_MAX_STMTS];
 		tnt_rules_t *rules;		/* heap copy: rules carry view bodies and
 								   must NOT sit on the API thread's stack */
 		int n, i;
+		const char *qtail = api_cmd_tail(cmd, 1);
 
-		if (!(q = api_join_query(argv, 1, argc))) {
-			stream->write_function(stream, "usage: tarantool translate <query>\n");
+		if (!qtail) {
+			stream->write_function(stream, "usage: tarantool translate [<profile>] <query>\n");
 			goto out;
 		}
+		/* [<profile>] <query>: первый токен, совпадающий с именем профиля,
+		 * считается профилем; иначе весь хвост — query, профиль — первый
+		 * в конфиге */
+		{
+			char first[64];
+
+			if (api_first_word(qtail, first, sizeof(first))) {
+				switch_mutex_lock(glob->mutex);
+				if (find_profile_locked(first)) {
+					snprintf(pname, sizeof(pname), "%s", first);
+					qtail = api_cmd_tail(qtail, 1);
+				}
+				switch_mutex_unlock(glob->mutex);
+			}
+		}
+		if (!qtail) {
+			stream->write_function(stream, "usage: tarantool translate [<profile>] <query>\n");
+			goto out;
+		}
+		q = strdup(qtail);
+		if (!q) {
+			stream->write_function(stream, "out of memory\n");
+			goto out;
+		}
+		/* full_scan профиля (явного или первого в конфиге) */
+		switch_mutex_lock(glob->mutex);
+		if (pname[0]) {
+			tnt_profile_cfg_t *fp = find_profile_locked(pname);
+
+			if (fp)
+				full_scan = fp->full_scan;
+		} else if (glob->nprofiles > 0) {
+			full_scan = glob->profiles[0].full_scan;
+		}
+		switch_mutex_unlock(glob->mutex);
+
 		switch_mutex_lock(glob->mutex);
 		rules = (tnt_rules_t *)malloc(sizeof(*rules));
 		if (rules) {
@@ -3092,6 +3182,17 @@ SWITCH_STANDARD_API(api_tarantool)
 			if (noop)
 				stream->write_function(stream, "[%d] (no-op)\n", i);
 			else if (out) {
+				if (full_scan) {
+					size_t ncap = strlen(out) * 2 + 64;
+					char *nb = (char *)malloc(ncap);
+
+					if (nb && tnt_sql_inject_seqscan(out, nb, ncap) == 0) {
+						free(out);
+						out = nb;
+					} else {
+						free(nb);
+					}
+				}
 				stream->write_function(stream, "[%d] %s;\n", i, out);
 				free(out);
 			} else {
@@ -3151,6 +3252,19 @@ static void tnt_maint_execute_sql(tnt_session_t *s, const tnt_rules_t *rules,
 		}
 		tnt_sql_quote_reserved(tr, final, ncap, words, nw);
 		free(tr);
+		/* full-scan profile: make scans explicit (the fork has no
+		 * sql_full_scan session variable, so FROM SEQSCAN t is required) */
+		if (s->cfg->full_scan) {
+			size_t ncap2 = strlen(final) * 2 + 64;
+			char *nb = (char *)malloc(ncap2);
+
+			if (nb && tnt_sql_inject_seqscan(final, nb, ncap2) == 0) {
+				free(final);
+				final = nb;
+			} else {
+				free(nb);
+			}
+		}
 
 		memset(&res, 0, sizeof(res));
 		rc = tnt_session_execute(s, final, 1, &res);

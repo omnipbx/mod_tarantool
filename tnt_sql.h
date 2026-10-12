@@ -157,4 +157,20 @@ SWITCH_DECLARE(int) tnt_sql_has_select_markers(const char *tpl, size_t len);
 SWITCH_DECLARE(int) tnt_sql_materialize_select(const char *tpl, tnt_sql_val_t *vals,
 											   int *nvals, char *out, size_t cap);
 
+/* Inject the SEQSCAN keyword before every table name in FROM/JOIN clauses
+ * (including subqueries inside DML: DELETE ... IN (SELECT ... FROM t1
+ * JOIN t2 ...)). Tarantool forbids full scans unless the session variable
+ * sql_full_scan is set - which the node01 fork does NOT know ("Session
+ * setting sql_full_scan doesn't exist") - so the only reliable way to allow
+ * a scan is the explicit FROM SEQSCAN t form.
+ *
+ * Rules: only statements that start with SELECT or are inside parentheses
+ * (subqueries) are touched, so "DELETE FROM t" stays untouched while its
+ * "IN (SELECT ... FROM t2 ...)" subquery gets SEQSCAN; "FROM (SELECT ...)"
+ * is not injected (the subquery has its own FROM); an already-present
+ * SEQSCAN is not duplicated; string literals, quoted identifiers and
+ * comments are skipped. Returns 0 on success, -1 when the output does not
+ * fit (cap includes the NUL). */
+SWITCH_DECLARE(int) tnt_sql_inject_seqscan(const char *sql, char *out, size_t cap);
+
 #endif /* TNT_SQL_H */
