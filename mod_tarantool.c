@@ -89,7 +89,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.9"
+#define TNT_VERSION	"1.0.10"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -2615,6 +2615,8 @@ SWITCH_STANDARD_API(api_tarantool)
 		stream->write_function(stream, "                    - runtime SQL template statistics\n");
 		stream->write_function(stream, "  cache on|off|reset | show [N] [full]\n");
 		stream->write_function(stream, "                    - statement translate cache control\n");
+		stream->write_function(stream, "  tarantool prepare on|off|reset|show\n");
+		stream->write_function(stream, "                    - statement prepared control\n");
 		stream->write_function(stream, "  cb show|reset     - shared circuit breaker state/counters\n");
 		stream->write_function(stream, "  reload            - reload tarantool.conf.xml\n");
 		stream->write_function(stream, "  drop              - release resources (no-op in v1)\n");
@@ -3149,6 +3151,16 @@ SWITCH_STANDARD_API(api_tarantool)
 		if (rc != 0) {
 			stream->write_function(stream, "error: %s\n", res.error[0] ? res.error : "unknown");
 		} else {
+			/* шапка: имена колонок, разделённые "|" (как implode) */
+			if (res.ncols > 0) {
+				int c;
+
+				for (c = 0; c < res.ncols; c++) {
+					stream->write_function(stream, "%s%s", c ? "|" : "",
+										   res.col_name[c] ? res.col_name[c] : "");
+				}
+				stream->write_function(stream, "\n");
+			}
 			for (r = 0; r < res.nrows; r++) {
 				int c;
 
@@ -3157,6 +3169,16 @@ SWITCH_STANDARD_API(api_tarantool)
 										   res.rows[r][c] ? res.rows[r][c] : "");
 				}
 				stream->write_function(stream, "\n");
+			}
+			/* SELECT вернул 0 строк (или DML без набора строк): иначе fs_cli
+			 * покажет "-ERR no reply" (API-команда не записала ни байта) */
+			if (res.nrows == 0) {
+				if (res.ncols > 0)
+					stream->write_function(stream, "(0 rows)\n");
+				else if (res.affected_rows >= 0)
+					stream->write_function(stream, "ok (%d rows)\n", res.affected_rows);
+				else
+					stream->write_function(stream, "ok\n");
 			}
 		}
 		free(q);
