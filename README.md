@@ -14,7 +14,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.8)
+## Возможности (v1.0.9)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -79,6 +79,14 @@ PostgreSQL.
   исполнения (ядро, `<maintenance>`, `tarantool sql`) и в `tarantool
   translate`. `DELETE FROM t` без подзапроса не трогается, уже
   присутствующий `SEQSCAN` не дублируется.
+- **Валидация API-команд** (`translate`/`sql`, v1.0.9): перед обработкой
+  запрос проходит резолв переменных `${now}`/`${epoch}`/`${hostname}`/
+  `${switchname}`/`${strftime(<fmt>)}` (тот же набор, что в
+  `<maintenance>`) и лёгкую проверку синтаксиса (`tnt_sql_validate`:
+  сплит на `;`, баланс скобок, незакрытые строки/комментарии,
+  распознавание ключевого слова). Неизвестная переменная или невалидный
+  SQL отклоняются с человекочитаемой причиной в консоли — без
+  round-trip к серверу (соединения может не быть при старте/обрыве).
 - **CLI API**: команда `tarantool` в fs_cli.
 
 ---
@@ -763,6 +771,29 @@ tarantool sql local "select * from channels limit 1"
 tarantool translate "create table channels (uuid varchar(255), name varchar(255))"
 tarantool translate local "delete from sip_subscriptions where sip_subscriptions_uuid in (select s.sip_subscriptions_uuid from sip_subscriptions s left join sip_registrations r on s.sip_user = r.sip_user where r.sip_user is null)"
 ```
+
+### Валидация `sql`/`translate` (v1.0.9)
+
+Обе команды перед обработкой прогоняют запрос через `api_resolve_validate`:
+
+1. **Резолв переменных** — тот же набор, что в `<maintenance>`:
+   `${now}`, `${epoch}`, `${hostname}`, `${switchname}`, `${strftime(<fmt>)}`.
+   Неизвестная переменная отклоняется:
+   ```
+   > tarantool translate "select * from t where ts > ${unknown}"
+   translate error: unknown maintenance variable 'unknown'
+   ```
+2. **Лёгкая проверка синтаксиса** (`tnt_sql_validate`): сплит на top-level
+   `;`, баланс скобок, незакрытые строки/комментарии, распознавание
+   ключевого слова. Невалидный SQL отклоняется без round-trip к серверу
+   (соединения может не быть при старте/обрыве):
+   ```
+   > tarantool sql local "SELCT * FRM t"
+   sql error: statement starts with unrecognized keyword 'selct'
+   ```
+
+Резолв выполняется с sample-time (`switch_epoch_time_now`), поэтому
+`${now}` в `translate`/`sql` подставляется текущим unix-временем.
 
 Пример вывода `check` для профиля с двумя хостами:
 

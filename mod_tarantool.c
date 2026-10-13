@@ -89,7 +89,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.8"
+#define TNT_VERSION	"1.0.9"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -2540,6 +2540,44 @@ static const char *api_first_word(const char *s, char *buf, size_t cap)
 	return n ? buf : NULL;
 }
 
+/* Resolve ${...} maintenance variables and validate SQL syntax for the
+ * sql/translate API commands. Variable resolution uses tnt_maint_expand
+ * with sample-time (the same set as <maintenance>: ${now}, ${epoch},
+ * ${hostname}, ${switchname}, ${strftime(<fmt>)}); an unknown variable
+ * aborts with "unknown maintenance variable '<name>'" in *reason. The
+ * resolved text is then checked by tnt_sql_validate (want_select=0: any
+ * DML/DDL is accepted, not only SELECT). Returns 0 on success with the
+ * resolved query in *resolved (rescap bytes incl. NUL); -1 on error with
+ * a human-readable cause in *reason (reason_cap bytes incl. NUL). */
+static int api_resolve_validate(const char *query, char *resolved, size_t rescap,
+								char *reason, size_t reason_cap)
+{
+	char badvar[128];
+
+	if (!query || !resolved || !reason || !reason_cap)
+		return -1;
+
+	badvar[0] = '\0';
+	reason[0] = '\0';
+
+	/* resolve variables: ${now}/${epoch}/${hostname}/${switchname}/${strftime(...)} */
+	if (tnt_maint_expand(query, resolved, rescap, switch_epoch_time_now(NULL),
+						 badvar, sizeof(badvar)) != 0) {
+		if (badvar[0])
+			snprintf(reason, reason_cap, "unknown maintenance variable '%s'", badvar);
+		else
+			snprintf(reason, reason_cap, "query too long or expansion failed");
+		return -1;
+	}
+
+	/* validate syntax: want_select=0 (accept any DML/DDL, not just SELECT) */
+	if (tnt_sql_validate(resolved, 0, reason, reason_cap) != 0) {
+		return -1;
+	}
+
+	return 0;
+}
+
 SWITCH_STANDARD_API(api_tarantool)
 {
 	char *mycopy = NULL;
@@ -3042,6 +3080,26 @@ SWITCH_STANDARD_API(api_tarantool)
 			stream->write_function(stream, "out of memory\n");
 			goto out;
 		}
+		/* resolve ${...} variables and validate syntax before executing */
+		{
+			char *resolved = (char *)malloc(strlen(q) * 2 + 64);
+			char reason[256];
+
+			if (!resolved) {
+				stream->write_function(stream, "out of memory\n");
+				free(q);
+				goto out;
+			}
+			if (api_resolve_validate(q, resolved, strlen(q) * 2 + 64,
+									 reason, sizeof(reason)) != 0) {
+				stream->write_function(stream, "sql error: %s\n", reason);
+				free(resolved);
+				free(q);
+				goto out;
+			}
+			free(q);
+			q = resolved;
+		}
 		switch_mutex_lock(glob->mutex);
 		{
 			tnt_profile_cfg_t *fp = find_profile_locked(pname);
@@ -3141,6 +3199,26 @@ SWITCH_STANDARD_API(api_tarantool)
 		if (!q) {
 			stream->write_function(stream, "out of memory\n");
 			goto out;
+		}
+		/* resolve ${...} variables and validate syntax before translating */
+		{
+			char *resolved = (char *)malloc(strlen(q) * 2 + 64);
+			char reason[256];
+
+			if (!resolved) {
+				stream->write_function(stream, "out of memory\n");
+				free(q);
+				goto out;
+			}
+			if (api_resolve_validate(q, resolved, strlen(q) * 2 + 64,
+									 reason, sizeof(reason)) != 0) {
+				stream->write_function(stream, "translate error: %s\n", reason);
+				free(resolved);
+				free(q);
+				goto out;
+			}
+			free(q);
+			q = resolved;
 		}
 		/* full_scan профиля (явного или первого в конфиге) */
 		switch_mutex_lock(glob->mutex);
