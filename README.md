@@ -100,10 +100,14 @@ src/mod/databases/mod_tarantool/
 ├── conf/
 │   └── tarantool.conf.xml # конфигурация (ставится в autoload_configs)
 ├── mod_tarantool.c        # регистрация интерфейса, парсинг XML, батч, API
+│                          #   (вкл. api_resolve_validate: резолв ${...} +
+│   │                       #   валидация синтаксиса для sql/translate)
 ├── tnt_client.c/.h        # IPROTO-клиент: connect/AUTH/EXECUTE/PING,
 │                          #   таймауты, failover, backoff, парсер ответов
 ├── tnt_sql.c/.h           # сплиттер SQL по top-level ';' и классификатор
-│                          #   операторов (CREATE/DROP/INSERT/UPDATE/...)
+│                          #   операторов (CREATE/DROP/INSERT/UPDATE/...),
+│                          #   tnt_sql_validate (лёгкая валидация синтаксиса),
+│                          #   tnt_sql_inject_seqscan (FROM SEQSCAN t)
 ├── tnt_rules.c/.h         # транслятор DDL (primaryKey/primaryKeyAdd/
 │                          #   addField, BIGINT→INTEGER, VIEW no-op и т.д.)
 ├── tnt_stats.c/.h         # runtime SQL-статистика ("tarantool sqlstats"),
@@ -112,8 +116,10 @@ src/mod/databases/mod_tarantool/
 ├── tnt_tcache.c/.h        # динамический кэш трансляции ("tarantool cache"),
 │                          #   чистый слой без switch_* (fetch/store/show,
 │                          #   eviction least-hits, приватные копии на hit)
+├── circuit_breaker.c/.h   # shared circuit breaker (per-host машина состояний
+│                          #   CLOSED→OPEN→HALF_OPEN, режимы off/wait/fast)
 └── mp_decode.c/.h         # минимальный MessagePack decoder/encoder
-                          #   (без внешних зависимостей)
+                           #   (без внешних зависимостей)
 ```
 
 Тесты слоёв (`mp_decode_test.c`, `tnt_sql_test.c`, `tnt_rules_test.c`,
