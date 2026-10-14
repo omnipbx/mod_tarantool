@@ -89,7 +89,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.10"
+#define TNT_VERSION	"1.0.11"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -173,6 +173,8 @@ typedef struct tnt_global {
 	int nmaint_sql;
 	int maint_interval;			/* seconds; 0 = disabled */
 	int maint_enabled;			/* effective: enable attr AND >=1 valid <sql> */
+	int64_t maint_last_run_mono;	/* CLOCK_MONOTONIC ms of the last round */
+	uint64_t maint_runs;			/* completed rounds */
 	uint32_t default_action_add;
 	char uuid_default_32[64];
 	char uuid_default_210[64];
@@ -217,6 +219,11 @@ static tnt_global_t *glob = NULL;
 /* Set by a successful reload so the <maintenance> thread re-reads the config
  * immediately (enable/interval/<sql> hot-applied, latency <= 250 ms). */
 static int maint_wakeup = 0;
+/* forward decls: the <maintenance> thread is defined below api_tarantool but
+ * referenced by the "tarantool maintenance restart" subcommand */
+static switch_thread_t *maint_thread;
+static int maint_thread_running;
+static void *SWITCH_THREAD_FUNC tnt_maint_run(switch_thread_t *thread, void *obj);
 
 /* Set while parsing when a <views> body exceeds TNT_VIEW_BODY_LEN. Such a
  * configuration must be REJECTED as a whole: on load the module refuses to
@@ -1208,6 +1215,13 @@ static switch_status_t config_load(void)
 	glob->cb_mode = ng->cb_mode;
 	glob->cb_failure_threshold = ng->cb_failure_threshold;
 	glob->cb_timeout_ms = ng->cb_timeout_ms;
+	/* <maintenance> config: parsed into ng, must reach the live glob — the
+	 * scheduler thread and "maintenance show" read glob. Runtime counters
+	 * (maint_last_run_mono / maint_runs) live in glob and survive reload. */
+	glob->maint_interval = ng->maint_interval;
+	glob->maint_enabled = ng->maint_enabled;
+	glob->nmaint_sql = ng->nmaint_sql;
+	memcpy(glob->maint_sql, ng->maint_sql, sizeof(glob->maint_sql));
 	snprintf(glob->uuid_default_32, sizeof(glob->uuid_default_32), "%s",
 			 ng->uuid_default_32[0] ? ng->uuid_default_32 : "uuid7()");
 	snprintf(glob->uuid_default_210, sizeof(glob->uuid_default_210), "%s",
@@ -2618,6 +2632,7 @@ SWITCH_STANDARD_API(api_tarantool)
 		stream->write_function(stream, "  tarantool prepare on|off|reset|show\n");
 		stream->write_function(stream, "                    - statement prepared control\n");
 		stream->write_function(stream, "  cb show|reset     - shared circuit breaker state/counters\n");
+		stream->write_function(stream, "  maintenance show|restart - <maintenance> scheduler state / immediate tick\n");
 		stream->write_function(stream, "  reload            - reload tarantool.conf.xml\n");
 		stream->write_function(stream, "  drop              - release resources (no-op in v1)\n");
 		stream->write_function(stream, "  version           - module version\n");
@@ -2814,6 +2829,38 @@ SWITCH_STANDARD_API(api_tarantool)
 			stream->write_function(stream, "cb: all breakers reset to closed\n");
 		} else {
 			stream->write_function(stream, "Usage: tarantool cb show|reset\n");
+		}
+	} else if (!strcasecmp(sub, "maintenance")) {
+		const char *what = argc > 1 ? argv[1] : NULL;
+
+		if (!what || !strcasecmp(what, "show")) {
+			int i;
+			char agebuf[32];
+
+			switch_mutex_lock(glob->mutex);
+			tnt_fmt_age(glob->maint_last_run_mono ?
+				(switch_micro_time_now() / 1000 - glob->maint_last_run_mono) / 1000 : -1,
+				agebuf, sizeof(agebuf));
+			stream->write_function(stream,
+				"maintenance: %s, interval=%ds, entries=%d, runs=%llu, last run %s ago\n",
+				glob->maint_enabled ? "enabled" : "disabled",
+				glob->maint_interval, glob->nmaint_sql,
+				(unsigned long long)glob->maint_runs,
+				glob->maint_last_run_mono ? agebuf : "never");
+			for (i = 0; i < glob->nmaint_sql; i++)
+				stream->write_function(stream, "  [%d] profile=%s\n    sql: %.1024s\n",
+					i, glob->maint_sql[i].profile, glob->maint_sql[i].sql);
+			switch_mutex_unlock(glob->mutex);
+		} else if (!strcasecmp(what, "restart")) {
+			maint_wakeup = 1;
+			/* respawn the thread if it died or was never started */
+			if (!maint_thread) {
+				maint_thread_running = 1;
+				switch_thread_create(&maint_thread, NULL, tnt_maint_run, NULL, glob->pool);
+			}
+			stream->write_function(stream, "maintenance: wakeup signaled\n");
+		} else {
+			stream->write_function(stream, "Usage: tarantool maintenance show|restart\n");
 		}
 	} else if (!strcasecmp(sub, "prepare")) {
 		const char *what = argc > 1 ? argv[1] : NULL;
@@ -3341,6 +3388,8 @@ static void tnt_maint_execute_sql(tnt_session_t *s, const tnt_rules_t *rules,
 		tnt_result_t res;
 		int rc, noop = 0;
 
+		if (tnt_debug_active(profile))
+			tnt_debug_log(profile, "maintenance:in", __FILE__, __func__, __LINE__, stmts[i].sql);
 		tr = tnt_rules_translate(rules, &stmts[i], 3, &ctx, &noop);
 		if (noop || !tr)
 			continue;
@@ -3367,6 +3416,8 @@ static void tnt_maint_execute_sql(tnt_session_t *s, const tnt_rules_t *rules,
 		}
 
 		memset(&res, 0, sizeof(res));
+		if (tnt_debug_active(profile))
+			tnt_debug_log(profile, "maintenance:out", __FILE__, __func__, __LINE__, final);
 		rc = tnt_session_execute(s, final, 1, &res);
 		if (rc != 0) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
@@ -3378,8 +3429,10 @@ static void tnt_maint_execute_sql(tnt_session_t *s, const tnt_rules_t *rules,
 	}
 }
 
-/* One maintenance round: snapshot config, verify mod_sofia, group the sql
- * entries by profile and run each group in a single session. All heavy data
+/* One maintenance round: snapshot config, group the sql entries by profile
+ * and run each group in a single session. The module is a generic driver and
+ * does not depend on any endpoint module (e.g. mod_sofia): the configured SQL
+ * runs as-is; missing tables surface as per-statement WARNINGs. All heavy data
  * lives on the heap (stack-safety rule from the load fix). */
 static void tnt_maint_iteration(void)
 {
@@ -3387,10 +3440,6 @@ static void tnt_maint_iteration(void)
 	tnt_rules_t *rr;
 	time_t now;
 	int n, i, j;
-
-	/* only while mod_sofia is loaded: its schema tables may not exist yet */
-	if (switch_loadable_module_exists("mod_sofia") != SWITCH_STATUS_SUCCESS)
-		return;
 
 	snap = (tnt_maint_sql_t *)malloc(sizeof(tnt_maint_sql_t) * TNT_MAINT_MAX);
 	rr = (tnt_rules_t *)malloc(sizeof(*rr));
@@ -3466,6 +3515,11 @@ static void tnt_maint_iteration(void)
 		}
 		tnt_session_close(&s);
 	}
+
+	switch_mutex_lock(glob->mutex);
+	glob->maint_last_run_mono = switch_micro_time_now() / 1000;
+	glob->maint_runs++;
+	switch_mutex_unlock(glob->mutex);
 
 	free(snap);
 	free(rr);

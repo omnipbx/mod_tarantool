@@ -14,7 +14,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.10)
+## Возможности (v1.0.11)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -598,8 +598,11 @@ view из-за усечения — после исправления разме
   load/reload и пропускается на итерации. Напоминание: `$${…}` (глобалы FS)
   раскрывает препроцессор ядра ещё при чтении конфига — неизвестный глобал
   ядро удаляет молча, получившийся битый SQL ловит валидатор;
-- поток работает только пока загружен `mod_sofia`
-  (`switch_loadable_module_exists`), иначе итерации пропускаются;
+- поток выполняется **независимо от других модулей** (в т.ч. `mod_sofia`):
+  модуль — generic-драйвер и не знает о существовании endpoint-модулей;
+  если таблицы ещё не созданы (например, sofia не загружен), statement
+  завершится ошибкой Tarantool → WARNING, остальные продолжаются;
+  фактическое состояние видно в `tarantool maintenance show` (runs/last run);
 - недоступные хосты профиля → WARNING + пропуск группы (без падения);
 - ошибка отдельного statement — WARNING (текст обрезан до 1 КБ), остальные
   продолжают выполняться;
@@ -763,6 +766,9 @@ tarantool sqlstats on|off|reset|tables|show   # статистика SQL-шаб�
 tarantool cache on|off|reset|show [N] [full]  # кэш трансляции
 tarantool prepare on|off|reset|show           # подготовленные statements
 tarantool cb show|reset                       # shared circuit breaker
+tarantool maintenance show|restart            # шедулер <maintenance>:
+                                              #   show — состояние и записи,
+                                              #   restart — немедленный тик
 tarantool reload              # перечитать tarantool.conf.xml
 tarantool drop                # освобождение ресурсов (no-op в v1)
 tarantool version             # версия модуля
@@ -1180,6 +1186,28 @@ tarantool cb reset   # все breaker'ы в CLOSED, счётчики обнул�
 circuit breaker: mode=wait threshold=3 timeout=5000ms hosts=1
   127.0.0.1:3301            state=open     fails=3 open_until=1750000000000 probing=0 opens=1 fail_fast=42 probes=1 successes=0
 ```
+
+### CLI
+
+```
+tarantool maintenance show    # enable/interval/entries/runs/last run + список <sql>
+tarantool maintenance restart # немедленный тик (wakeup); если поток умер —
+                              # пересоздаётся
+```
+
+Пример вывода:
+
+```
+maintenance: enabled, interval=120s, entries=1, runs=42, last run 00:00:37 ago
+  [0] profile=local
+    sql: delete from sip_subscriptions where sip_subscriptions_uuid not in (select ...)
+```
+
+`runs` — число завершённых итераций, `last run` — время с последней
+(«never», если поток ещё ни разу не отработал — например, сразу после
+старта или при `enable="false"`). При `tarantool debug on` каждая итерация
+пишет в лог пары `in`/`out` для каждого statement'а `<maintenance>` (как и
+обычные запросы).
 
 ### Конфигурация (`<settings>`)
 

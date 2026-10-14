@@ -269,10 +269,10 @@
            a warning and is NOT applied;
          - cleanup runs only while mod_sofia is loaded; unreachable profiles
            are skipped with a WARNING. -->
-  <maintenance interval="120" enable="false">
+  <maintenance interval="120" enable="true">
+    <sql profile="local"><![CDATA[DELETE FROM sip_subscriptions WHERE sip_subscriptions_uuid NOT IN (SELECT s.sip_subscriptions_uuid FROM sip_subscriptions s JOIN sip_registrations r ON s.sip_user = r.sip_user AND s.network_ip = r.network_ip AND s.network_port = r.network_port)]]></sql>
     <!--
-    <sql profile="local"><![CDATA[delete from sip_presence where expires > 0 and expires <= ${now}; delete from sip_subscriptions where expires > 0 and expires <= ${now}]]></sql>
-    <sql profile="local"><![CDATA[delete from sip_registrations where expires > 0 and expires <= ${now}; delete from sip_dialogs where expires > 0 and expires <= ${now}]]></sql>
+    <sql profile="local"><![CDATA[DELETE FROM sip_presence WHERE sip_presence_uuid NOT IN (SELECT s.sip_presence_uuid FROM sip_presence s JOIN sip_registrations r ON s.sip_user = r.sip_user AND s.network_ip = r.network_ip AND s.network_port = r.network_port)]]></sql>
     -->
   </maintenance>
 
