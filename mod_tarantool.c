@@ -45,6 +45,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <time.h>              /* clock_gettime / struct timespec */
 #include <unistd.h>            /* getentropy() */
 
 #include <private/switch_uuidv7_pvt.h>
@@ -2488,6 +2489,17 @@ static void api_print_profile(switch_stream_handle_t *stream, const tnt_profile_
 	(void)detail;
 }
 
+/* CLOCK_MONOTONIC milliseconds since boot (the same clock tnt_client.c uses
+ * to timestamp conn.last_used_mono). switch_micro_time_now() is wall-clock
+ * (epoch), so subtracting it from a monotonic timestamp yields garbage. */
+static int64_t tnt_mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /* Format a duration (seconds) as days:hours:minutes:seconds with units
 	* appearing progressively: "1d 02:03:04", "02:03:04", "03:04", "4s". */
 static void tnt_fmt_age(int64_t sec, char *buf, size_t cap)
@@ -3003,7 +3015,9 @@ SWITCH_STANDARD_API(api_tarantool)
 
 				ch = &h->profile.hosts[s->cur >= 0 && s->cur < h->profile.nhosts ? s->cur : 0];
 				now_ms = switch_micro_time_now() / 1000;
-				idle_ms = now_ms - s->conn.last_used_mono;
+				/* keep the same clock as conn.last_used_mono (CLOCK_MONOTONIC);
+				 * wall-clock now_ms is used only for the epoch-based age below */
+				idle_ms = tnt_mono_ms() - s->conn.last_used_mono;
 				if (idle_ms < 0)
 					idle_ms = 0;
 
