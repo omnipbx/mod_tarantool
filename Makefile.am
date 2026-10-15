@@ -15,7 +15,7 @@ mod_tarantool_la_CFLAGS  = $(AM_CFLAGS) -std=gnu99 -D_GNU_SOURCE -Wno-error=peda
 mod_tarantool_la_LIBADD  = $(switch_builddir)/libfreeswitch.la
 mod_tarantool_la_LDFLAGS = -avoid-version -module -no-undefined -shared
 
-EXTRA_DIST = conf/tarantool.conf.xml README.md
+EXTRA_DIST = conf/tarantool.conf.xml README.md README_ru.md
 
 confdir=$(sysconfdir)/freeswitch/autoload_configs
 
