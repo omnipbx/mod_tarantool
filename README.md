@@ -17,7 +17,7 @@ FreeSWITCH itself.
 
 ---
 
-## Features (v1.0.11)
+## Features (v1.0.12)
 
 - **Core DB registration**: the full set of 10 `switch_database_interface_t`
   callbacks (`handle_new`/`destroy`, `exec_detailed`, `exec_string`,

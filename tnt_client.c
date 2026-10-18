@@ -1612,6 +1612,7 @@ SWITCH_DECLARE(int) tnt_conn_ping(tnt_conn_t *c)
 	c->last_used_mono = mono_ms();
 	memset(&res, 0, sizeof(res));
 	rc = parse_response(c, &res);
+	tnt_result_free(&res);
 	return rc < 0 ? -1 : 0;
 }
 
@@ -1701,12 +1702,15 @@ SWITCH_DECLARE(int) tnt_conn_prepare(tnt_conn_t *c, const char *sql_q,
 		return -1;
 	c->last_used_mono = mono_ms();
 	rc = parse_response(c, &res);
-	if (rc < 0)
+	if (rc < 0) {
+		tnt_result_free(&res);
 		return -1;
+	}
 	if (rc > 0) {
 		/* a SQL error (DDL not preparable, syntax, old server, ...) */
 		if (res.error[0])
 			snprintf(c->error, sizeof(c->error), "%s", res.error);
+		tnt_result_free(&res);
 		return 1;
 	}
 	if (!res.has_stmt_id) {
@@ -1721,9 +1725,11 @@ SWITCH_DECLARE(int) tnt_conn_prepare(tnt_conn_t *c, const char *sql_q,
 			snprintf(hex + 3 * i, sizeof(hex) - 3 * i, "%02x ", c->rsp[i]);
 		conn_seterr(c, "PREPARE response carries no stmt_id (rsp %zu bytes: %s)",
 					c->rsp_len, hex);
+		tnt_result_free(&res);
 		return 1;
 	}
 	*stmt_id = res.stmt_id;
+	tnt_result_free(&res);
 	return 0;
 }
 
