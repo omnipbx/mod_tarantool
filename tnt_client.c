@@ -623,8 +623,10 @@ static int conn_unix_connect(tnt_conn_t *c, uint32_t timeout_ms)
 	struct sockaddr_un sa;
 	int fd;
 	int one = 1;
+	size_t alen;
 
-	if (strlen(c->addr) >= sizeof(sa.sun_path)) {
+	alen = strlen(c->addr);
+	if (alen >= sizeof(sa.sun_path)) {
 		conn_seterr(c, "unix socket path too long: %s", c->addr);
 		return -1;
 	}
@@ -636,7 +638,10 @@ static int conn_unix_connect(tnt_conn_t *c, uint32_t timeout_ms)
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sun_family = AF_UNIX;
-	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", c->addr);
+	/* length already checked above; memcpy keeps gcc -Wformat-truncation
+	 * silent on old toolchains (FreeSWITCH 1.10 / gcc 8 build) */
+	memcpy(sa.sun_path, c->addr, alen);
+	sa.sun_path[alen] = '\0';
 
 	if (sock_connect_timeout(fd, (struct sockaddr *)&sa, sizeof(sa), timeout_ms) < 0) {
 		conn_seterr(c, "connect(unix:%s) failed: %s", c->addr, strerror(errno));

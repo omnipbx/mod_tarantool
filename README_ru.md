@@ -16,7 +16,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.12)
+## Возможности (v1.0.13)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -206,6 +206,50 @@ sudo make install       # установит модуль и conf/tarantool.conf
 После установки модуль окажется в `$(libdir)/freeswitch/mod/`, а конфиг — в
 `$(sysconfdir)/freeswitch/autoload_configs/tarantool.conf.xml`
 (`install-data-local` в Makefile.am делает это автоматически).
+
+#### Ручная сборка на уже-скомпилированном дереве FreeSWITCH
+
+**Важно:** модуль состоит из нескольких единиц трансляции
+(`tnt_client.c`, `tnt_rules.c`, `tnt_sql.c`, `tnt_stats.c`, `tnt_tcache.c`,
+`circuit_breaker.c`, `mp_decode.c` + `mod_tarantool.c`). Штатный
+`modmake.rules` FreeSWITCH линкует модуль только из `$(MODNAME).lo` +
+`$(LOCAL_OBJS)`: если просто скопировать модуль в **уже-сконфигурированное**
+дерево и выполнить `make mod_tarantool`, скомпилируется только
+`mod_tarantool.c`, а все `tnt_*`-хелперы не попадут в `.so`, что приведёт к
+ошибке при загрузке:
+
+```
+Error Loading module /usr/lib/freeswitch/mod/mod_tarantool.so:
+  undefined symbol: tnt_result_free
+```
+
+Причина двойная: в Makefile модуля переменная `LOCAL_OBJS` должна объявляться
+**до** `include modmake.rules` (GNU make раскрывает примитивы в момент
+парсинга), а суффиксное правило `.c.lo` обходится рекурсивным вызовом make
+FreeSWITCH.
+
+**Решение — используйте прилагаемый `build.sh` как пред-make шаг**
+(автоопределяет корень FreeSWITCH, перегенерирует Makefile модуля с
+`LOCAL_OBJS` до include и явными правилами `.lo` для каждого хелпера):
+
+```bash
+cd <freeSWITCH>                       # из корня исходников
+./src/mod/databases/mod_tarantool/build.sh   # пред-make: чинит Makefile
+make mod_tarantool                    # соберёт ВСЕ исходники в .so
+make mod_tarantool-install            # установит модуль
+```
+
+Примечания:
+
+- на тулчейнах с gcc >= 8 сборка дополнительно использует
+  `-Wno-error=format-truncation` (иначе length-guarded `snprintf()` на сокетах
+  может сломать сборку через `-Werror`);
+- `build.sh` идемпотентен — безопасно повторять после любых правок исходников;
+- для `dpkg-buildpackage` этот шаг **не нужен**: чистая сборка из tar
+  перегенерирует Makefile из полного `Makefile.am` (полный
+  `mod_tarantool_la_SOURCES`), поэтому все единицы трансляции линкуются и там;
+- проверка после сборки: `nm -D .libs/mod_tarantool.so | grep tnt_result_free`
+  должен показать `T tnt_result_free`.
 
 ### 5. Подключите модуль в runtime-конфигурации
 

@@ -17,7 +17,7 @@ FreeSWITCH itself.
 
 ---
 
-## Features (v1.0.12)
+## Features (v1.0.13)
 
 - **Core DB registration**: the full set of 10 `switch_database_interface_t`
   callbacks (`handle_new`/`destroy`, `exec_detailed`, `exec_string`,
@@ -209,6 +209,48 @@ sudo make install       # installs the module and conf/tarantool.conf.xml
 After installation the module lands in `$(libdir)/freeswitch/mod/` and the
 config in `$(sysconfdir)/freeswitch/autoload_configs/tarantool.conf.xml`
 (`install-data-local` in Makefile.am does this automatically).
+
+#### Manual build on an already-compiled FreeSWITCH tree
+
+**Important:** this module consists of several translation units
+(`tnt_client.c`, `tnt_rules.c`, `tnt_sql.c`, `tnt_stats.c`, `tnt_tcache.c`,
+`circuit_breaker.c`, `mp_decode.c` plus `mod_tarantool.c`). FreeSWITCH's own
+`modmake.rules` links a module only from `$(MODNAME).lo` + `$(LOCAL_OBJS)`:
+if you simply copy the module into an **already-configured** tree and run
+`make mod_tarantool`, only `mod_tarantool.c` is compiled and every `tnt_*`
+helper is missing from the `.so`, which fails at load time with
+
+```
+Error Loading module /usr/lib/freeswitch/mod/mod_tarantool.so:
+  undefined symbol: tnt_result_free
+```
+
+The reason is two-fold: the module `Makefile` must declare `LOCAL_OBJS`
+**before** `include modmake.rules` (GNU make expands prerequisites at parse
+time), and the implicit `.c.lo` suffix rule is bypassed by FreeSWITCH's
+recursive make invocation.
+
+**Solution — use the supplied `build.sh` as a pre-make step** (it
+auto-detects the FreeSWITCH root, regenerates the module `Makefile` with
+`LOCAL_OBJS` before the include and explicit `.lo` rules for every helper):
+
+```bash
+cd <freeSWITCH>                       # from the source root
+./src/mod/databases/mod_tarantool/build.sh   # pre-make: fixes the Makefile
+make mod_tarantool                    # builds ALL sources into the .so
+make mod_tarantool-install            # installs the module
+```
+
+Notes:
+
+- on toolchains with gcc >= 8 the build also passes `-Wno-error=format-truncation`
+  (length-guarded `snprintf()` on sockets can otherwise trip `-Werror`);
+- `build.sh` is idempotent — safe to re-run after any source change;
+- this is **not** required for `dpkg-buildpackage`: a clean build from the
+  tarball regenerates the Makefile from the complete `Makefile.am` (full
+  `mod_tarantool_la_SOURCES`), so all translation units are linked there too;
+- to verify after the build: `nm -D .libs/mod_tarantool.so | grep tnt_result_free`
+  must show `T tnt_result_free`.
 
 ### 5. Load the module in the runtime configuration
 

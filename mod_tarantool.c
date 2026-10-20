@@ -48,7 +48,10 @@
 #include <time.h>              /* clock_gettime / struct timespec */
 #include <unistd.h>            /* getentropy() */
 
-#include <private/switch_uuidv7_pvt.h>
+/* Local copy for FreeSWITCH 1.10 compatibility (uuidv7_pvt.h added in 1.11).
+ * The header is self-contained (stddef/stdint only, static inline) and
+ * carries the original Apache-2.0 license from LiosK/uuidv7-h. */
+#include "switch_uuidv7_pvt.h"
 
 #include "tnt_client.h"
 #include "tnt_rules.h"
@@ -90,7 +93,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.12"
+#define TNT_VERSION	"1.0.13"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
