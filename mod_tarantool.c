@@ -3186,6 +3186,9 @@ SWITCH_STANDARD_API(api_tarantool)
 			words[wi] = wbuf[wi];
 
 		tnt_session_init(&s, &prof);
+		memset(&res, 0, sizeof(res));	/* zero BEFORE the first execute:
+										   an SQL error (e.g. unknown table)
+										   leaves nrows/ncols/rows untouched */
 		/* apply the same translation as the core path (primaryKeyAdd /
 		 * addField injection, CREATE TABLE rewrite, ...) BEFORE quoting */
 		{

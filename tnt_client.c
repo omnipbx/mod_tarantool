@@ -1578,6 +1578,10 @@ SWITCH_DECLARE(int) tnt_conn_execute(tnt_conn_t *c, const char *sql, tnt_result_
 	size_t rlen;
 	int rc;
 
+	/* always start from a clean result: an SQL/protocol error path fills
+	 * only res->error and leaves the row fields untouched, so a caller's
+	 * later tnt_result_free() must never iterate stale pointers */
+	memset(res, 0, sizeof(*res));
 	tnt_mp_writer_init(&w, body, sizeof(body));
 	if (build_request(c, IPROTO_EXECUTE, &w) < 0)
 		return -1;
