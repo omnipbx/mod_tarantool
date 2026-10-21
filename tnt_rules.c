@@ -820,14 +820,18 @@ typedef struct inj_col {
 	char expr[192];
 } inj_col_t;
 
-/* INSERT INTO <table> (<cols>) VALUES (...): inject columns the caller did
- * not supply:
+/* INSERT INTO <table> (<cols>) VALUES (...) — inject columns the caller
+ * did not supply:
  *   - primaryKeyAdd rule: the synthetic PK column, filled with the
  *     configured source (core UUIDv7 literal/CAST, or uuid() for uuid type);
  *   - addField rules with isNull="false" and a value: the configured value
  *     ($${var} is expanded at runtime through ctx->resolver).
- * Multi-row INSERTs and statements that already list the columns are left
- * unchanged (NULL). Returns a malloc'ed rewritten statement or NULL. */
+ * The INSERT may omit the column list entirely ("INSERT INTO t VALUES
+ * (...)" — the form used by the FreeSWITCH core): the injected expressions
+ * are then appended to the END of the value tuple, which matches the order
+ * in which the columns were appended by CREATE TABLE (pkadd, addFields).
+ * Multi-row INSERTs are left unchanged (NULL). Returns a malloc'ed
+ * rewritten statement or NULL. */
 static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 								   tnt_translate_ctx_t *ctx)
 {
@@ -838,7 +842,8 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 	int ninj = 0;
 	size_t len = st->end - st->start;
 	const char *sql = st->sql + st->start;
-	size_t cl, cr, vl, vr, i;
+	size_t cl, cr = 0, vl, vr, vw, i;
+	int has_cols = 0;
 	char *out;
 	size_t cap, o = 0;
 
@@ -846,7 +851,11 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 	if (!pa && naf == 0)
 		return NULL;
 
-	/* column-list opening paren after the table name */
+	/* locate the VALUES keyword FIRST: with it we can tell whether the
+	 * statement carries an explicit column list. */
+	vw = find_word(sql, len, "values");
+	if (vw == SIZE_MAX)
+		return NULL;
 	cl = SIZE_MAX;
 	for (i = 0; i < len; i++) {
 		if (sql[i] == '(') {
@@ -854,19 +863,21 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 			break;
 		}
 	}
-	if (cl == SIZE_MAX)
-		return NULL;
-	cr = r_match_paren(sql, len, cl);
-	if (cr == SIZE_MAX)
-		return NULL;
-
-	/* VALUES keyword and the first value tuple */
-	vl = find_word(sql + cr + 1, len - cr - 1, "values");
-	if (vl == SIZE_MAX)
-		return NULL;
-	vl += cr + 1 + 6;		/* skip past the "values" keyword itself */
-	while (vl < len && isspace((unsigned char)sql[vl]))
-		vl++;
+	/* explicit column list: '(' sits before VALUES */
+	has_cols = (cl != SIZE_MAX && cl < vw);
+	if (has_cols) {
+		cr = r_match_paren(sql, len, cl);
+		if (cr == SIZE_MAX || cr > vw)
+			return NULL;
+		vl = vw + 6;			/* skip past the "values" keyword itself */
+		while (vl < len && isspace((unsigned char)sql[vl]))
+			vl++;
+	} else {
+		/* INSERT INTO t VALUES (...): the first '(' IS the value tuple */
+		vl = cl;
+		if (vl == SIZE_MAX)
+			return NULL;
+	}
 	if (vl >= len || sql[vl] != '(')
 		return NULL;
 	vr = r_match_paren(sql, len, vl);
@@ -885,8 +896,9 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 		break;
 	}
 
-	/* primaryKeyAdd column */
-	if (pa && !r_list_has(sql, cl + 1, cr, pa->field)) {
+	/* primaryKeyAdd column (no explicit list -> inject unconditionally:
+	 * the empty slot detection relies on a present column list only) */
+	if (pa && (!has_cols || !r_list_has(sql, cl + 1, cr, pa->field))) {
 		int cu = pkadd_core_uuid(pa);
 		int isu = type_is_uuid(pa->type[0] ? pa->type : "varchar(36)");
 
@@ -932,7 +944,7 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 
 		if (f->is_null || !val[0])
 			continue;
-		if (r_list_has(sql, cl + 1, cr, f->field))
+		if (has_cols && r_list_has(sql, cl + 1, cr, f->field))
 			continue;
 		vlen = strlen(val);
 		/* resolve $${global} / ${var} ONLY when in-line="true"; without the
@@ -978,18 +990,25 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 	if (ninj == 0)
 		return NULL;
 
-	/* rebuild: cols-head + injected fields + ") VALUES (" +
-	 * original tuple values + injected exprs + ")" */
+	/* rebuild: cols-head + injected fields + ") VALUES (" + original
+	 * tuple values + injected exprs + ")".  The no-column-list form
+	 * (INSERT INTO t VALUES (...)) cannot take a head: expressions are
+	 * appended to the tuple END, matching the order in which CREATE
+	 * TABLE put the injected columns (pkadd first, then addFields). */
 	cap = len + 256 * (size_t)ninj;
 	out = (char *)malloc(cap);
 	if (!out)
 		return NULL;
-	buf_putn(out, cap, &o, sql, cr);
-	for (i = 0; i < (size_t)ninj; i++) {
-		buf_puts(out, cap, &o, ", ");
-		buf_puts(out, cap, &o, inj[i].field);
+	if (has_cols) {
+		buf_putn(out, cap, &o, sql, cr);
+		for (i = 0; i < (size_t)ninj; i++) {
+			buf_puts(out, cap, &o, ", ");
+			buf_puts(out, cap, &o, inj[i].field);
+		}
+		buf_putn(out, cap, &o, sql + cr, vl + 1 - cr);
+	} else {
+		buf_putn(out, cap, &o, sql, vl + 1);
 	}
-	buf_putn(out, cap, &o, sql + cr, vl + 1 - cr);
 	{
 		int orig_empty = 1;
 		size_t j;

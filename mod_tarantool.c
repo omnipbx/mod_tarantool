@@ -3186,67 +3186,113 @@ SWITCH_STANDARD_API(api_tarantool)
 			words[wi] = wbuf[wi];
 
 		tnt_session_init(&s, &prof);
-		memset(&res, 0, sizeof(res));
-		/* quote Tarantool-reserved identifiers so manual queries work too */
+		/* apply the same translation as the core path (primaryKeyAdd /
+		 * addField injection, CREATE TABLE rewrite, ...) BEFORE quoting */
 		{
-			size_t ncap = strlen(q) * 2 + 64;
-			char *nq = (char *)malloc(ncap);
+			tnt_rules_t *rules = NULL;
+			tnt_stmt_t stmts[TNT_SQL_MAX_STMTS];
+			int n = 0, si;
 
-			if (nq) {
-				tnt_sql_quote_reserved(q, nq, ncap, words, nwords);
+			switch_mutex_lock(glob->mutex);
+			rules = (tnt_rules_t *)malloc(sizeof(*rules));
+			if (rules) {
+				*rules = glob->rules;
+				snprintf(rules->uuid_default, sizeof(rules->uuid_default), "%s", glob->uuid_default_32);
+			}
+			switch_mutex_unlock(glob->mutex);
+			if (!rules) {
+				stream->write_function(stream, "out of memory\n");
 				free(q);
-				q = nq;
+				goto out;
 			}
-		}
-		/* full-scan profile: make scans explicit (the fork has no
-		 * sql_full_scan session variable, so FROM SEQSCAN t is required) */
-		if (prof.full_scan) {
-			size_t ncap = strlen(q) * 2 + 64;
-			char *nq = (char *)malloc(ncap);
+			n = tnt_sql_split(q, stmts, TNT_SQL_MAX_STMTS);
+			for (si = 0; si < n; si++) {
+				char *exec;
+				int noop = 0;
+				tnt_translate_ctx_t ctx;
+				char uuidbuf[40];
 
-			if (nq && tnt_sql_inject_seqscan(q, nq, ncap) == 0) {
-				free(q);
-				q = nq;
-			} else {
-				free(nq);
-			}
-		}
-		rc = tnt_session_execute(&s, q, 1, &res);
-		if (rc != 0) {
-			stream->write_function(stream, "error: %s\n", res.error[0] ? res.error : "unknown");
-		} else {
-			/* шапка: имена колонок, разделённые "|" (как implode) */
-			if (res.ncols > 0) {
-				int c;
-
-				for (c = 0; c < res.ncols; c++) {
-					stream->write_function(stream, "%s%s", c ? "|" : "",
-										   res.col_name[c] ? res.col_name[c] : "");
+				memset(&ctx, 0, sizeof(ctx));
+				if (tnt_uuidv7(uuidbuf) == 0)
+					ctx.core_uuid = uuidbuf;
+				ctx.resolver = tnt_resolve_global;
+				exec = tnt_rules_translate(rules, &stmts[si], 3, &ctx, &noop);
+				if (noop) {
+					stream->write_function(stream, "[%d] (no-op)\n", si);
+					continue;
 				}
-				stream->write_function(stream, "\n");
-			}
-			for (r = 0; r < res.nrows; r++) {
-				int c;
+				if (!exec) {
+					/* pass-through: use the original text */
+					size_t l = stmts[si].end - stmts[si].start;
 
-				for (c = 0; c < res.ncols; c++) {
-					stream->write_function(stream, "%s%s", c ? "|" : "",
-										   res.rows[r][c] ? res.rows[r][c] : "");
+					exec = (char *)malloc(l + 1);
+					if (!exec) {
+						stream->write_function(stream, "out of memory\n");
+						break;
+					}
+					memcpy(exec, stmts[si].sql + stmts[si].start, l);
+					exec[l] = '\0';
 				}
-				stream->write_function(stream, "\n");
+				/* quote Tarantool-reserved identifiers so manual queries work too */
+				{
+					size_t ncap = strlen(exec) * 2 + 64;
+					char *nq = (char *)malloc(ncap);
+
+					if (nq) {
+						tnt_sql_quote_reserved(exec, nq, ncap, words, nwords);
+						free(exec);
+						exec = nq;
+					}
+				}
+				/* full-scan profile: make scans explicit ... */
+				if (prof.full_scan) {
+					size_t ncap = strlen(exec) * 2 + 64;
+					char *nq = (char *)malloc(ncap);
+
+					if (nq && tnt_sql_inject_seqscan(exec, nq, ncap) == 0) {
+						free(exec);
+						exec = nq;
+					} else {
+						free(nq);
+					}
+				}
+				rc = tnt_session_execute(&s, exec, 1, &res);
+				if (rc != 0) {
+					stream->write_function(stream, "[%d] error: %s\n", si,
+										   res.error[0] ? res.error : "unknown");
+				} else {
+					if (res.ncols > 0) {
+						int c;
+						for (c = 0; c < res.ncols; c++) {
+							stream->write_function(stream, "%s%s", c ? "|" : "",
+												   res.col_name[c] ? res.col_name[c] : "");
+						}
+						stream->write_function(stream, "\n");
+					}
+					for (r = 0; r < res.nrows; r++) {
+						int c;
+						for (c = 0; c < res.ncols; c++) {
+							stream->write_function(stream, "%s%s", c ? "|" : "",
+												   res.rows[r][c] ? res.rows[r][c] : "");
+						}
+						stream->write_function(stream, "\n");
+					}
+					if (res.nrows == 0) {
+						if (res.ncols > 0)
+							stream->write_function(stream, "(0 rows)\n");
+						else if (res.affected_rows >= 0)
+							stream->write_function(stream, "ok (%d rows)\n", res.affected_rows);
+						else
+							stream->write_function(stream, "ok\n");
+					}
+				}
+				free(exec);
+				tnt_result_free(&res);
+				memset(&res, 0, sizeof(res));
 			}
-			/* SELECT вернул 0 строк (или DML без набора строк): иначе fs_cli
-			 * покажет "-ERR no reply" (API-команда не записала ни байта) */
-			if (res.nrows == 0) {
-				if (res.ncols > 0)
-					stream->write_function(stream, "(0 rows)\n");
-				else if (res.affected_rows >= 0)
-					stream->write_function(stream, "ok (%d rows)\n", res.affected_rows);
-				else
-					stream->write_function(stream, "ok\n");
-			}
+			free(rules);
 		}
 		free(q);
-		tnt_result_free(&res);
 		tnt_session_close(&s);
 	} else if (!strcasecmp(sub, "translate")) {
 		char *q = NULL;
