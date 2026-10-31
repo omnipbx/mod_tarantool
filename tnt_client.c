@@ -1572,7 +1572,15 @@ out:
 
 SWITCH_DECLARE(int) tnt_conn_execute(tnt_conn_t *c, const char *sql, tnt_result_t *res)
 {
-	uint8_t body[4096];
+	/* dynamic buffer: long statements (presence payload XML, dialog data,
+	 * multi-row UPDATEs) MUST NOT fail here. A fixed buffer made any SQL
+	 * longer than ~4 KB return -1 - which the caller treats as a TRANSPORT
+	 * failure: the healthy connection was closed, its prepared-statement
+	 * cache died, the circuit breaker counted a failure and under load
+	 * quickly opened, paralyzing every core SQL thread (the "lost
+	 * connection" defect seen under mass calling + presence). */
+	size_t blen = 128 + strlen(sql);
+	uint8_t *body;
 	tnt_mp_writer_t w;
 	uint8_t *rbody;
 	size_t rlen;
@@ -1582,18 +1590,24 @@ SWITCH_DECLARE(int) tnt_conn_execute(tnt_conn_t *c, const char *sql, tnt_result_
 	 * only res->error and leaves the row fields untouched, so a caller's
 	 * later tnt_result_free() must never iterate stale pointers */
 	memset(res, 0, sizeof(*res));
-	tnt_mp_writer_init(&w, body, sizeof(body));
-	if (build_request(c, IPROTO_EXECUTE, &w) < 0)
+	body = (uint8_t *)malloc(blen);
+	if (!body) {
+		conn_seterr(c, "out of memory building EXECUTE request (%zu bytes)", blen);
 		return -1;
-	/* execute body: {IPROTO_SQL_TEXT: sql} */
-	if (tnt_mp_write_map_header(&w, 1) < 0)
+	}
+	tnt_mp_writer_init(&w, body, blen);
+	if (build_request(c, IPROTO_EXECUTE, &w) < 0 ||
+		tnt_mp_write_map_header(&w, 1) < 0 ||
+		tnt_mp_write_uint(&w, IPROTO_SQL_TEXT) < 0 ||
+		tnt_mp_write_str(&w, sql, strlen(sql)) < 0) {
+		/* impossible with blen = 128 + strlen(sql), kept for safety */
+		conn_seterr(c, "EXECUTE request encoding failed");
+		free(body);
 		return -1;
-	if (tnt_mp_write_uint(&w, IPROTO_SQL_TEXT) < 0)
-		return -1;
-	if (tnt_mp_write_str(&w, sql, strlen(sql)) < 0)
-		return -1;
-
-	if (conn_send_request(c, IPROTO_EXECUTE, body, w.len) < 0)
+	}
+	rc = conn_send_request(c, IPROTO_EXECUTE, body, w.len);
+	free(body);
+	if (rc < 0)
 		return -1;
 	if (conn_recv_frame(c, &rbody, &rlen) < 0)
 		return -1;
@@ -1686,7 +1700,10 @@ SWITCH_DECLARE(void) tnt_conn_prep_drop(tnt_conn_t *c, uint64_t hash)
 SWITCH_DECLARE(int) tnt_conn_prepare(tnt_conn_t *c, const char *sql_q,
 									 uint32_t *stmt_id)
 {
-	uint8_t body[8192];
+	/* dynamic buffer, same reasoning as tnt_conn_execute: a template that
+	 * does not fit a fixed buffer must not masquerade as a transport error */
+	size_t blen = 128 + strlen(sql_q);
+	uint8_t *body;
 	tnt_mp_writer_t w;
 	uint8_t *rbody;
 	size_t rlen;
@@ -1694,18 +1711,24 @@ SWITCH_DECLARE(int) tnt_conn_prepare(tnt_conn_t *c, const char *sql_q,
 	int rc;
 
 	memset(&res, 0, sizeof(res));
-	tnt_mp_writer_init(&w, body, sizeof(body));
-	if (build_request(c, IPROTO_PREPARE, &w) < 0)
+	body = (uint8_t *)malloc(blen);
+	if (!body) {
+		conn_seterr(c, "out of memory building PREPARE request (%zu bytes)", blen);
 		return -1;
-	/* prepare body: {IPROTO_SQL_TEXT: sql} */
-	if (tnt_mp_write_map_header(&w, 1) < 0)
+	}
+	tnt_mp_writer_init(&w, body, blen);
+	if (build_request(c, IPROTO_PREPARE, &w) < 0 ||
+		tnt_mp_write_map_header(&w, 1) < 0 ||
+		tnt_mp_write_uint(&w, IPROTO_SQL_TEXT) < 0 ||
+		tnt_mp_write_str(&w, sql_q, strlen(sql_q)) < 0) {
+		/* impossible with blen = 128 + strlen(sql_q), kept for safety */
+		conn_seterr(c, "PREPARE request encoding failed");
+		free(body);
 		return -1;
-	if (tnt_mp_write_uint(&w, IPROTO_SQL_TEXT) < 0)
-		return -1;
-	if (tnt_mp_write_str(&w, sql_q, strlen(sql_q)) < 0)
-		return -1;
-
-	if (conn_send_request(c, IPROTO_PREPARE, body, w.len) < 0)
+	}
+	rc = conn_send_request(c, IPROTO_PREPARE, body, w.len);
+	free(body);
+	if (rc < 0)
 		return -1;
 	if (conn_recv_frame(c, &rbody, &rlen) < 0)
 		return -1;
@@ -1746,6 +1769,11 @@ SWITCH_DECLARE(int) tnt_conn_exec_stmt(tnt_conn_t *c, uint32_t stmt_id,
 									   const uint8_t *bind, size_t bind_len,
 									   tnt_result_t *res)
 {
+	/* same contract as tnt_conn_execute: start from a clean result so the
+	 * caller's tnt_result_free() never iterates stale pointers even when
+	 * an early return (OOM, transport) touched nothing */
+	memset(res, 0, sizeof(*res));
+	{
 	uint8_t *body;
 	size_t blen = 64 + bind_len;
 	tnt_mp_writer_t w;
@@ -1785,6 +1813,7 @@ SWITCH_DECLARE(int) tnt_conn_exec_stmt(tnt_conn_t *c, uint32_t stmt_id,
 	c->last_used_mono = mono_ms();
 	rc = parse_response(c, res);
 	return rc;
+	}
 }
 
 SWITCH_DECLARE(int) tnt_bind_encode(const tnt_sql_val_t *vals, int nvals,

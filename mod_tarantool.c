@@ -93,7 +93,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.13"
+#define TNT_VERSION	"1.0.14"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
