@@ -465,7 +465,18 @@ SWITCH_DECLARE(void) tnt_conn_init(tnt_conn_t *c, const tnt_host_cfg_t *h,
 								   const char *user, const char *pass,
 								   uint32_t rw_timeout_ms)
 {
+	/* keep the growable response buffer across a re-init: the struct may be
+	 * re-initialised in place (failover) and the buffer is still owned by
+	 * this conn unless tnt_conn_close() released it (then it is NULL/0 and
+	 * the memset below is a no-op for these fields) */
+	uint8_t *rsp = c->rsp;
+	size_t rsp_cap = c->rsp_cap;
+	size_t rsp_len = c->rsp_len;
+
 	memset(c, 0, sizeof(*c));
+	c->rsp = rsp;
+	c->rsp_cap = rsp_cap;
+	c->rsp_len = rsp_len;
 	c->fd = -1;
 	c->use_unix = h->use_unix;
 	snprintf(c->addr, sizeof(c->addr), "%s", h->addr);
@@ -532,6 +543,14 @@ SWITCH_DECLARE(void) tnt_conn_close(tnt_conn_t *c)
 		close(c->fd);
 		c->fd = -1;
 	}
+	/* the growable response buffer can be as large as the biggest reply:
+	 * release it with the connection instead of leaking it on every
+	 * reconnect (CB oscillations could otherwise leak hundreds of KB each
+	 * time the breaker re-probes a host) */
+	free(c->rsp);
+	c->rsp = NULL;
+	c->rsp_cap = 0;
+	c->rsp_len = 0;
 	tnt_conn_prep_reset(c);		/* stmt_ids die with the connection */
 }
 
@@ -1230,9 +1249,15 @@ SWITCH_DECLARE(void) tnt_result_free(tnt_result_t *res)
 {
 	int r, c;
 
+	/* tnt_result_init() sets ncols/nrows BEFORE the calloc calls and
+	 * returns -1 when one of them fails (OOM), so col_name/col_type may
+	 * legitimately be NULL while ncols > 0: dereferencing them here would
+	 * crash the whole process */
 	for (c = 0; c < res->ncols; c++) {
-		free(res->col_name[c]);
-		free(res->col_type[c]);
+		if (res->col_name)
+			free(res->col_name[c]);
+		if (res->col_type)
+			free(res->col_type[c]);
 	}
 	free(res->col_name);
 	free(res->col_type);
@@ -1607,12 +1632,23 @@ SWITCH_DECLARE(int) tnt_conn_execute(tnt_conn_t *c, const char *sql, tnt_result_
 	}
 	rc = conn_send_request(c, IPROTO_EXECUTE, body, w.len);
 	free(body);
-	if (rc < 0)
+	if (rc < 0) {
+		/* transport failure: the socket may hold a partially written
+		 * request or a late reply - a later statement on this fd would
+		 * read a FOREIGN frame (sync mismatch). Drop the connection now. */
+		tnt_conn_close(c);
 		return -1;
-	if (conn_recv_frame(c, &rbody, &rlen) < 0)
+	}
+	if (conn_recv_frame(c, &rbody, &rlen) < 0) {
+		/* recv timeout: the server may still deliver this reply later;
+		 * keeping the fd would desynchronise the next request/response */
+		tnt_conn_close(c);
 		return -1;
+	}
 	c->last_used_mono = mono_ms();
 	rc = parse_response(c, res);
+	if (rc < 0)
+		tnt_conn_close(c);
 	return rc;
 }
 
@@ -1628,15 +1664,23 @@ SWITCH_DECLARE(int) tnt_conn_ping(tnt_conn_t *c)
 	tnt_mp_writer_init(&w, body, sizeof(body));
 	if (build_request(c, IPROTO_PING, &w) < 0)
 		return -1;
-	if (conn_send_request(c, IPROTO_PING, body, w.len) < 0)
+	if (conn_send_request(c, IPROTO_PING, body, w.len) < 0) {
+		tnt_conn_close(c);
 		return -1;
-	if (conn_recv_frame(c, &rbody, &rlen) < 0)
+	}
+	if (conn_recv_frame(c, &rbody, &rlen) < 0) {
+		tnt_conn_close(c);
 		return -1;
+	}
 	c->last_used_mono = mono_ms();
 	memset(&res, 0, sizeof(res));
 	rc = parse_response(c, &res);
 	tnt_result_free(&res);
-	return rc < 0 ? -1 : 0;
+	if (rc < 0) {
+		tnt_conn_close(c);
+		return -1;
+	}
+	return 0;
 }
 
 /* ---------- prepared statements ---------- */
@@ -1728,14 +1772,20 @@ SWITCH_DECLARE(int) tnt_conn_prepare(tnt_conn_t *c, const char *sql_q,
 	}
 	rc = conn_send_request(c, IPROTO_PREPARE, body, w.len);
 	free(body);
-	if (rc < 0)
+	if (rc < 0) {
+		/* transport failure: never leave a desynchronised fd behind */
+		tnt_conn_close(c);
 		return -1;
-	if (conn_recv_frame(c, &rbody, &rlen) < 0)
+	}
+	if (conn_recv_frame(c, &rbody, &rlen) < 0) {
+		tnt_conn_close(c);
 		return -1;
+	}
 	c->last_used_mono = mono_ms();
 	rc = parse_response(c, &res);
 	if (rc < 0) {
 		tnt_result_free(&res);
+		tnt_conn_close(c);
 		return -1;
 	}
 	if (rc > 0) {
@@ -1806,12 +1856,20 @@ SWITCH_DECLARE(int) tnt_conn_exec_stmt(tnt_conn_t *c, uint32_t stmt_id,
 	}
 	rc = conn_send_request(c, IPROTO_EXECUTE, body, w.len);
 	free(body);
-	if (rc < 0)
+	if (rc < 0) {
+		/* transport failure on a prepared EXECUTE: drop the fd so the
+		 * caller's plain-path fallback cannot read a FOREIGN frame */
+		tnt_conn_close(c);
 		return -1;
-	if (conn_recv_frame(c, &rbody, &rlen) < 0)
+	}
+	if (conn_recv_frame(c, &rbody, &rlen) < 0) {
+		tnt_conn_close(c);
 		return -1;
+	}
 	c->last_used_mono = mono_ms();
 	rc = parse_response(c, res);
+	if (rc < 0)
+		tnt_conn_close(c);
 	return rc;
 	}
 }

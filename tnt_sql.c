@@ -539,6 +539,11 @@ SWITCH_DECLARE(size_t) tnt_sql_quote_reserved(const char *src, char *dst, size_t
 	}
 done:
 	dst[o] = '\0';
+	if (src[i] != '\0') {
+		/* the buffer was exhausted before the end of src: never let the
+		 * caller send a silently TRUNCATED statement to Tarantool */
+		return SIZE_MAX;
+	}
 	return o;
 }
 

@@ -82,9 +82,12 @@ SWITCH_DECLARE(size_t) tnt_sql_find_keyword(const char *s, size_t len, const cha
  * <reserved> section); words may be NULL when nwords == 0. String literals and
  * already-quoted identifiers are copied verbatim; a reserved word immediately
  * followed by '(' (function call, e.g. uuid()) is left alone.
- * Writes at most dstcap bytes incl. NUL; returns chars written (excluding NUL). */
+ * Writes at most dstcap bytes incl. NUL. Returns the number of chars written
+ * (excluding NUL), or SIZE_MAX when dstcap was too small and the output had
+ * to be cut short: the caller MUST then discard dst and never send it as SQL
+ * (a truncated statement would surface as a bogus syntax error). */
 SWITCH_DECLARE(size_t) tnt_sql_quote_reserved(const char *src, char *dst, size_t dstcap,
-											  const char *const *words, int nwords);
+ 										  const char *const *words, int nwords);
 
 /* Lightweight config-time SQL validation (no server round-trip): splits the
  * string on top-level ';' and rejects empty/comment-only input, too many

@@ -93,7 +93,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.14"
+#define TNT_VERSION	"1.0.15"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -1633,29 +1633,19 @@ static uint64_t tnt_str_hash(const char *s)
 }
 
 /* Pick the connection for the next statement: the pinned one while a
- * transaction is in progress (all statements of the transaction MUST hit
- * the same connection), otherwise round-robin. The pinned connection is
- * skipped by other callers when pool_size > 1. Short h->lock hold. */
+ * transaction is in progress (ALL statements of the transaction MUST hit
+ * the same connection - BEGIN/INSERT/UPDATE/COMMIT on different sessions
+ * would silently run the DML outside the transaction and commit an empty
+ * one), otherwise round-robin. Short h->lock hold. */
 static tnt_session_t *pick_session(tnt_handle_t *h, int *idx)
 {
 	tnt_session_t *s;
-	int i, k;
 
 	switch_mutex_lock(h->lock);
-	if (h->tx_pinned && h->pool_size > 1) {
-		for (i = 0; i < h->pool_size; i++) {
-			k = (h->rr + i) % h->pool_size;
-			if (k == h->tx_idx)
-				continue;
-			h->rr = (k + 1) % h->pool_size;
-			*idx = k;
-			s = &h->sessions[k];
-			switch_mutex_unlock(h->lock);
-			return s;
-		}
-	}
 	if (h->tx_pinned) {
-		/* pool_size == 1: the transaction owns the only connection */
+		/* the transaction owns tx_idx on EVERY pool size: the old code
+		 * skipped tx_idx when pool_size > 1, spreading the transaction
+		 * statements over other connections (broken transactions) */
 		*idx = h->tx_idx;
 		s = &h->sessions[h->tx_idx];
 	} else {
@@ -2013,9 +2003,11 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 					goto stmt_done;
 				}
 				/* Quote Tarantool-reserved identifiers; takes ownership of
-				 * 'pre'. Worst case doubles the size. */
+				 * 'pre'. Every quoted word grows by two chars, so x3+64 is
+				 * a safe bound; on overflow (SIZE_MAX) keep the unquoted
+				 * translation - never send a TRUNCATED statement. */
 				{
-					size_t ncap = strlen(pre) * 2 + 64;
+					size_t ncap = strlen(pre) * 3 + 64;
 					char *nb = (char *)malloc(ncap);
 
 					if (!nb) {
@@ -2027,8 +2019,12 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 						status = SWITCH_STATUS_FALSE;
 						goto stmt_done;
 					}
-					tnt_sql_quote_reserved(pre, nb, ncap, words, nwords);
-					free(pre);
+					if (tnt_sql_quote_reserved(pre, nb, ncap, words, nwords) == (size_t)-1) {
+						free(nb);
+						nb = pre;	/* overflow: keep the unquoted text */
+					} else {
+						free(pre);
+					}
 					out = nb;
 					/* full-scan profile: make scans explicit (the fork has
 					 * no sql_full_scan session variable, so FROM SEQSCAN t
@@ -2098,7 +2094,7 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 							goto stmt_done;
 						}
 						{
-							size_t ncap = strlen(out) * 2 + 64;
+							size_t ncap = strlen(out) * 3 + 64;
 							char *nb = (char *)malloc(ncap);
 
 							if (!nb) {
@@ -2110,9 +2106,12 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 								status = SWITCH_STATUS_FALSE;
 								goto stmt_done;
 							}
-							tnt_sql_quote_reserved(out, nb, ncap, words, nwords);
-							free(out);
-							out = nb;
+							if (tnt_sql_quote_reserved(out, nb, ncap, words, nwords) == (size_t)-1) {
+								free(nb);	/* overflow: keep the unquoted text */
+							} else {
+								free(out);
+								out = nb;
+							}
 							if (h->profile.full_scan) {
 								size_t ncap2 = strlen(out) * 2 + 64;
 								char *nb2 = (char *)malloc(ncap2);
@@ -2644,7 +2643,7 @@ SWITCH_STANDARD_API(api_tarantool)
 		stream->write_function(stream, "                    - runtime SQL template statistics\n");
 		stream->write_function(stream, "  cache on|off|reset | show [N] [full]\n");
 		stream->write_function(stream, "                    - statement translate cache control\n");
-		stream->write_function(stream, "  tarantool prepare on|off|reset|show\n");
+		stream->write_function(stream, "  prepare on|off|reset|show\n");
 		stream->write_function(stream, "                    - statement prepared control\n");
 		stream->write_function(stream, "  cb show|reset     - shared circuit breaker state/counters\n");
 		stream->write_function(stream, "  maintenance show|restart - <maintenance> scheduler state / immediate tick\n");
@@ -3238,13 +3237,16 @@ SWITCH_STANDARD_API(api_tarantool)
 				}
 				/* quote Tarantool-reserved identifiers so manual queries work too */
 				{
-					size_t ncap = strlen(exec) * 2 + 64;
+					size_t ncap = strlen(exec) * 3 + 64;
 					char *nq = (char *)malloc(ncap);
 
 					if (nq) {
-						tnt_sql_quote_reserved(exec, nq, ncap, words, nwords);
-						free(exec);
-						exec = nq;
+						if (tnt_sql_quote_reserved(exec, nq, ncap, words, nwords) == (size_t)-1) {
+							free(nq);	/* overflow: keep the unquoted text */
+						} else {
+							free(exec);
+							exec = nq;
+						}
 					}
 				}
 				/* full-scan profile: make scans explicit ... */
@@ -3459,14 +3461,18 @@ static void tnt_maint_execute_sql(tnt_session_t *s, const tnt_rules_t *rules,
 		tr = tnt_rules_translate(rules, &stmts[i], 3, &ctx, &noop);
 		if (noop || !tr)
 			continue;
-		ncap = strlen(tr) * 2 + 64;
+		ncap = strlen(tr) * 3 + 64;
 		final = (char *)malloc(ncap);
 		if (!final) {
 			free(tr);
 			continue;
 		}
-		tnt_sql_quote_reserved(tr, final, ncap, words, nw);
-		free(tr);
+		if (tnt_sql_quote_reserved(tr, final, ncap, words, nw) == (size_t)-1) {
+			free(final);
+			final = tr;		/* overflow: keep the unquoted text */
+		} else {
+			free(tr);
+		}
 		/* full-scan profile: make scans explicit (the fork has no
 		 * sql_full_scan session variable, so FROM SEQSCAN t is required) */
 		if (s->cfg->full_scan) {
@@ -3681,6 +3687,12 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_tarantool_load)
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
 							  "mod_tarantool: module load aborted: <views> body exceeds %d bytes; "
 							  "fix tarantool.conf.xml and retry\n", TNT_VIEW_BODY_LEN);
+			/* both mutexes were created before config_load(): release
+			 * them, otherwise the aborted load leaks two mutexes */
+			if (glob->cache_mutex)
+				switch_mutex_destroy(glob->cache_mutex);
+			if (glob->stats_mutex)
+				switch_mutex_destroy(glob->stats_mutex);
 			switch_mutex_destroy(glob->mutex);
 			free(glob);
 			glob = NULL;

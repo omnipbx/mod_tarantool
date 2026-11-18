@@ -17,7 +17,7 @@ FreeSWITCH itself.
 
 ---
 
-## Features (v1.0.14)
+## Features (v1.0.15)
 
 - **Core DB registration**: the full set of 10 `switch_database_interface_t`
   callbacks (`handle_new`/`destroy`, `exec_detailed`, `exec_string`,
@@ -1109,8 +1109,9 @@ Key properties:
   per-connection mutex, so `pool-size>1` spreads concurrent requests across
   several connections.
 - **Transactions**: `set_auto_commit(false)` pins the current connection to
-  the handle (`[tx]` in `tarantool conns`); all transaction statements go to
-  it, while other calls with `pool-size>1` bypass the pinned connection.
+  the handle (`[tx]` in `tarantool conns`); **every** statement of the handle
+  (BEGIN/INSERT/UPDATE/DELETE/COMMIT) goes to the pinned connection for any
+  `pool-size`, so the whole transaction always runs on one session.
   `commit`/`rollback` release the pin.
 - **Failover ×N**: each pool session independently selects a host and
   reconnects; with `pool-size>1` the failure of one connection does not block
@@ -1147,6 +1148,20 @@ live master, connect to it (replicas stay unused while the master gets extra
 sockets + fibers + prep-caches). Load distribution across replicas
 (SELECT → replica, write → master) is a separate role-aware routing feature
 (the `role` attribute is ignored in v1).
+
+### Host selection on reconnect
+
+The host list is **ordered**: the first entry is the preferred one and the
+first *reachable* host wins at connect time. The reconnect scan, however,
+starts at the **next** host after the one used last time —
+`tnt_session_open()` walks the list as `(cur + 1) % nhosts`. Practical
+consequence: after a failure on host *k* the session tries *k+1*, … and
+wraps around, so **once the preferred host comes back the next reconnect
+does not necessarily return to it immediately** — the rotation continues
+from the previous position and the session returns to the preferred host
+only after the wrap-around (or when the other hosts are unreachable). This
+matters when a local `unix-socket` is listed first: a replica that stayed
+reachable may keep serving the session until the next failover.
 
 ### What `pool-size` really determines
 
