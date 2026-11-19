@@ -93,7 +93,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.15"
+#define TNT_VERSION	"1.0.16"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -682,6 +682,105 @@ trunc:
 	return -1;
 }
 
+/* Parse one <param> of <primaryKey>/<primaryKeyAdd> into pf[]/npf.
+	* Two forms are accepted:
+	*   legacy    - <param table field [type] [core-uuid]/> (single field);
+	*   composite - <param table><fields><field name [type] [core-uuid]/>...
+	*             </fields></param> (1..TNT_PK_FIELDS_MAX fields).
+	* gen_allowed: the section accepts generated fields (type/core-uuid on a
+	* <field>); <primaryKey> does not - its fields only NAME existing columns.
+	* legacy_default_type: applied to the legacy single-field form when the
+	* type attribute is absent ("varchar(36)" - the historical pkadd default;
+	* NULL for <primaryKey> - never generated).
+	* Returns 1 when pf/npf are valid and the rule must be added. */
+static int parse_pk_param(switch_xml_t param, const char *secname,
+						  int gen_allowed, const char *legacy_default_type,
+						  tnt_pk_field_t *pf, int *npf)
+{
+	const char *f = switch_xml_attr(param, "field");
+	switch_xml_t fsec = switch_xml_child(param, "fields");
+	int n = 0;
+
+	*npf = 0;
+	if (f && fsec) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+						  "mod_tarantool: <%s> 'field' and <fields> are mutually exclusive; param ignored\n",
+						  secname);
+		return 0;
+	}
+	if (fsec) {
+		switch_xml_t fl;
+		int bad = 0;
+
+		for (fl = switch_xml_child(fsec, "field"); fl; fl = fl->next) {
+			const char *nm = switch_xml_attr(fl, "name");
+			const char *ty = switch_xml_attr(fl, "type");
+			const char *cu = switch_xml_attr(fl, "core-uuid");
+			static const char *const fa[] = { "name", "type", "core-uuid", NULL };
+			int m;
+
+			tnt_warn_unknown_attrs(fl, fa, "field");
+			if (!gen_allowed && (ty || cu)) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <%s> field '%s': 'type'/'core-uuid' are "
+								  "meaningless here; ignored\n", secname, nm ? nm : "?");
+				ty = NULL;
+				cu = NULL;
+			}
+			if (!nm || !nm[0]) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: <%s>: <field> without a name ignored\n", secname);
+				continue;
+			}
+			for (m = 0; m < n; m++) {
+				if (!strcmp(pf[m].field, nm)) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+									  "mod_tarantool: <%s>: duplicate PK field '%s'; param rejected\n",
+									  secname, nm);
+					bad = 1;
+					break;
+				}
+			}
+			if (bad)
+				break;
+			if (n >= TNT_PK_FIELDS_MAX) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+								  "mod_tarantool: <%s>: field '%s' exceeds TNT_PK_FIELDS_MAX (%d); "
+								  "param rejected\n", secname, nm, TNT_PK_FIELDS_MAX);
+				bad = 1;
+				break;
+			}
+			snprintf(pf[n].field, sizeof(pf[n].field), "%s", nm);
+			snprintf(pf[n].type, sizeof(pf[n].type), "%s", ty ? ty : "");
+			pf[n].core_uuid = cu ? parse_bool_attr(cu, 0) : -1;
+			n++;
+		}
+		if (bad)
+			return 0;
+		if (n == 0) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+							  "mod_tarantool: <%s>: empty <fields>; param ignored\n", secname);
+			return 0;
+		}
+		*npf = n;
+		return 1;
+	}
+	if (f && f[0]) {
+		const char *ty = switch_xml_attr(param, "type");
+		const char *cu = switch_xml_attr(param, "core-uuid");
+
+		snprintf(pf[0].field, sizeof(pf[0].field), "%s", f);
+		snprintf(pf[0].type, sizeof(pf[0].type), "%s",
+				 ty ? ty : (legacy_default_type ? legacy_default_type : ""));
+		pf[0].core_uuid = cu ? parse_bool_attr(cu, 0) : -1;
+		*npf = 1;
+		return 1;
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+					  "mod_tarantool: <%s>: param without 'field' or <fields> ignored\n", secname);
+	return 0;
+}
+
 static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 {
 	switch_xml_t sec, param;
@@ -790,27 +889,29 @@ static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 	for (sec = switch_xml_child(xml, "primaryKey"); sec; sec = sec->next) {
 		for (param = switch_xml_child(sec, "param"); param; param = param->next) {
 			const char *t = switch_xml_attr(param, "table");
-			const char *f = switch_xml_attr(param, "field");
 			static const char *const a[] = { "table", "field", NULL };
+			tnt_pk_field_t pf[TNT_PK_FIELDS_MAX];
+			int npf;
 
 			tnt_warn_unknown_attrs(param, a, "primaryKey");
-			if (t && f)
-				tnt_rules_add_pk(&g->rules, t, f);
+			if (t && parse_pk_param(param, "primaryKey", 0, NULL, pf, &npf))
+				tnt_rules_add_pk(&g->rules, t, pf, npf);
 		}
 	}
 	for (sec = switch_xml_child(xml, "primaryKeyAdd"); sec; sec = sec->next) {
 		for (param = switch_xml_child(sec, "param"); param; param = param->next) {
 			const char *t = switch_xml_attr(param, "table");
-			const char *f = switch_xml_attr(param, "field");
-			const char *ty = switch_xml_attr(param, "type");
-			const char *cu = switch_xml_attr(param, "core-uuid");
 			static const char *const a[] = { "table", "field", "type",
 				"core-uuid", NULL };
+			tnt_pk_field_t pf[TNT_PK_FIELDS_MAX];
+			int npf;
 
 			tnt_warn_unknown_attrs(param, a, "primaryKeyAdd");
-			if (t && f)
-				tnt_rules_add_pkadd(&g->rules, t, f, ty ? ty : "",
-									cu ? parse_bool_attr(cu, 0) : -1);
+			/* legacy single-field form without 'type' keeps the historical
+			 * default of varchar(36); in the composite form an absent type
+			 * means "value not generated" (DDL column or <addField>) */
+			if (t && parse_pk_param(param, "primaryKeyAdd", 1, "varchar(36)", pf, &npf))
+				tnt_rules_add_pkadd(&g->rules, t, pf, npf);
 		}
 	}
 	for (sec = switch_xml_child(xml, "addField"); sec; sec = sec->next) {
@@ -830,6 +931,43 @@ static void parse_rule_tables(switch_xml_t xml, tnt_global_t *g)
 				tnt_rules_add_field(&g->rules, t, f, ty ? ty : "STRING",
 									parse_bool_attr(nl, 1), df ? df : "",
 									vl ? vl : "", parse_bool_attr(il, 0));
+		}
+	}
+
+	/* <primaryKeyAdd> fields with an empty type take their value from
+		* <addField>; a PK part can never be NULL - reject the whole rule when
+		* the covering <addField> is nullable or valueless */
+	{
+		int i, k, m;
+
+		for (i = 0; i < g->rules.npkadd; i++) {
+			tnt_pk_rule_t *rp = &g->rules.pkadd[i];
+			int bad = 0;
+
+			for (k = 0; k < rp->nfields && !bad; k++) {
+				if (rp->f[k].type[0])
+					continue;		/* generated: value is always present */
+				for (m = 0; m < g->rules.nfields; m++) {
+					if (!strcmp(g->rules.fields[m].table, rp->table) &&
+						!strcmp(g->rules.fields[m].field, rp->f[k].field)) {
+						if (g->rules.fields[m].is_null || !g->rules.fields[m].value[0]) {
+							switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT,
+											  "mod_tarantool: <primaryKeyAdd> table '%s': PK field "
+											  "'%s' comes from a nullable/valueless <addField>; "
+											  "a PK part cannot be NULL - rule rejected\n",
+											  rp->table, rp->f[k].field);
+							bad = 1;
+						}
+						break;
+					}
+				}
+			}
+			if (bad) {
+				memmove(&g->rules.pkadd[i], &g->rules.pkadd[i + 1],
+						(size_t)(g->rules.npkadd - i - 1) * sizeof(g->rules.pkadd[0]));
+				g->rules.npkadd--;
+				i--;
+			}
 		}
 	}
 }

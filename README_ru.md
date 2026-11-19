@@ -16,7 +16,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.15)
+## Возможности (v1.0.16)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -40,6 +40,10 @@ PostgreSQL.
 - **DDL-транслятор**: FreeSWITCH/core и mod_sofia выдают SQLite-подобный DDL,
   который Tarantool-диалект не понимает «как есть». Модуль транслирует его по
   декларативным правилам из конфига (см. ниже).
+- **Композитный PRIMARY KEY** (v1.0.16): `<primaryKey>`/`<primaryKeyAdd>`
+  принимают до 4 полей (`TNT_PK_FIELDS_MAX`); поле без `type` только участвует
+  в PK-клаузе — его колонка есть в DDL ядра или добавляется `<addField>`, и
+  значение для такого поля модуль не генерирует.
 - **Батч-запросы**: SQL вида `stmt1;stmt2;...` (типично для mod_sofia)
   разбивается корректным сплиттером (строки `''`, комментарии, скобки) и
   выполняется последовательно.
@@ -473,6 +477,63 @@ FreeSWITCH создаёт таблицы БЕЗ явного PRIMARY KEY (нап
   <param table="registrations" field="registrations_uuid" type="varchar(36)" core-uuid="true"/>
 </primaryKeyAdd>
 ```
+
+#### Композитный PRIMARY KEY (v1.0.16, до 4 полей)
+
+Обе секции принимают композитный ключ до `TNT_PK_FIELDS_MAX = 4` полей:
+
+```xml
+<primaryKey>
+  <param table="channels" field="uuid"/>
+  <param table="recovery">
+    <fields>
+      <field name="uuid"/>
+      <field name="hostname"/>
+    </fields>
+  </param>
+</primaryKey>
+
+<primaryKeyAdd>
+  <param table="calls" field="calls_uuid" type="varchar(36)" core-uuid="true"/>
+  <param table="registrations">
+    <fields>
+      <field name="registrations_uuid" type="varchar(36)" core-uuid="true"/>
+      <field name="hostname"/>
+    </fields>
+  </param>
+</primaryKeyAdd>
+```
+
+Правила:
+
+- итоговая клауза — `PRIMARY KEY (f1, f2, ...)` **в порядке объявления**;
+  первое поле — префикс индекса: первым ставьте наиболее селективную
+  колонку поиска (`WHERE uuid=...` использует префикс, `WHERE hostname=...` —
+  нет);
+- **`<field>` без `type` модулем НЕ генерируется**: поле только участвует в
+  PK-клаузе, а его значение должно приходить либо из колонки DDL ядра
+  (например, `registrations.hostname` передаётся в INSERT самим ядром),
+  либо из правила `<addField>` (например,
+  `value="$${switch_uuid}" in-line="true"`);
+- поле С `type` добавляется в `CREATE TABLE` (если такой колонки ещё нет) и
+  его значение инжектируется в каждый INSERT — как в single-field форме;
+- legacy-атрибуты (`field=`/`type=`/`core-uuid=` на `<param>`) работают без
+  изменений; `<primaryKeyAdd>` без `type` сохраняет исторический дефолт
+  `varchar(36)` (только композитная форма трактует отсутствие `type` как
+  «не генерировать»);
+- ошибки конфигурации логируются как CRIT, а проблемное правило
+  пропускается (тихая обрезка запрещена): смешение `field=` и `<fields>`,
+  пустой список, больше 4 полей, дубли имён, а также PK-поле, которое не
+  генерируется, отсутствует в DDL и не покрыто `<addField>` (в последнем
+  случае PK-клауза опускается, чтобы ядро не ушло в цикл инициализации).
+  PK-часть, приходящая из nullable/беззначенного `<addField>`, также
+  отклоняет правило — часть PK не может быть NULL.
+
+**Миграция**: уже существующая таблица сохраняет старый PK — Tarantool
+игнорирует `CREATE TABLE` для существующего спейса, а проверка схемы ядром
+(`select <колонка> from <таблица>`) проходит. Удалите таблицу вручную
+(`DROP TABLE recovery`) и дайте FreeSWITCH пересоздать её, затем проверьте
+`box.space.recovery.index[0].parts`.
 
 ### `<addField>` — добавление произвольных колонок
 
