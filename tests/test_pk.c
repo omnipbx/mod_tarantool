@@ -23,6 +23,11 @@
  *                                                 value injected from addField
  *   T11 empty-type field NOT covered anywhere  -> PRIMARY KEY clause skipped
  *   T16 type=uuid + core-uuid=false            -> forced core UUIDv7
+ *   T17 regression (v1.0.17): the template->raw retranslate runs
+ *       inject_insert_columns TWICE into the same stack frame; the addField
+ *       branch used to leave inj[].expr UNTERMINATED, so the second call
+ *       spliced stale stack bytes into the literal (live case on the VM:
+ *       takeover got '0'a1f600-8a1a-7c97-ab6c-f30dea4a9477').
  */
 
 #include "tnt_rules.h"
@@ -399,6 +404,50 @@ static void t16_uuid_type_forced_core(void)
 	free(out);
 }
 
+static const char *t17_seq[2];
+static int t17_idx;
+
+static const char *t17_resolver(const char *name, void *ud)
+{
+	(void)ud;
+	if (!strcmp(name, "marker"))
+		return t17_seq[t17_idx];
+	return NULL;
+}
+
+static void t17_double_inject_termination(void)
+{
+	tnt_rules_t r;
+	tnt_translate_ctx_t ctx;
+	char *out1, *out2;
+
+	tnt_rules_init(&r);
+	assert(tnt_rules_add_field(&r, "t17", "marker", "varchar(64)",
+							   0, "", "$${marker}", 1) == 0);
+
+	/* first inject: a LONG resolved value fills inj[].expr deep into the
+	 * stack frame; second inject: a one-char value written over it */
+	t17_seq[0] = "OLDVALUE-oldpayload-0123456789abcdef";
+	t17_seq[1] = "N";
+	t17_idx = 0;
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.resolver = t17_resolver;
+	out1 = translate(&r, "insert into t17 values ('x')", TNT_STMT_INSERT, "t17", &ctx);
+	CHECK_STR(out1, "'OLDVALUE-oldpayload-0123456789abcdef')", "T17: first inject value");
+	CHECK(ctx.ctx_dep == 1, "T17: first inject is ctx_dep");
+	free(out1);
+
+	t17_idx = 1;
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.resolver = t17_resolver;
+	out2 = translate(&r, "insert into t17 values ('x')", TNT_STMT_INSERT, "t17", &ctx);
+	CHECK_STR(out2, "'N')", "T17: second inject exact short literal");
+	CHECK_NO_STR(out2, "OLDVALUE", "T17: no stale stack bytes spliced");
+	CHECK_NO_STR(out2, "oldpayload", "T17: no stale tail after the literal");
+	free(out2);
+}
+
 int main(void)
 {
 	t1_legacy_pk_single();
@@ -413,6 +462,7 @@ int main(void)
 	t10_empty_type_via_addfield();
 	t11_uncovered_empty_type();
 	t16_uuid_type_forced_core();
+	t17_double_inject_termination();
 
 	if (failures) {
 		printf("\n%d check(s) FAILED\n", failures);

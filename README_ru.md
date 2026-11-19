@@ -16,7 +16,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.16)
+## Возможности (v1.0.17)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,

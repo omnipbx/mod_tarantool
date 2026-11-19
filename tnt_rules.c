@@ -1079,6 +1079,14 @@ static char *inject_insert_columns(const tnt_rules_t *r, const tnt_stmt_t *st,
 			} else {
 				sq_literal(inj[ninj].expr, sizeof(inj[ninj].expr), &eo, val);
 			}
+			/* sq_literal/buf_puts do NOT NUL-terminate, and inj[] is a
+			 * dirty stack buffer: a SECOND inject call into the same stack
+			 * frame (the template->raw retranslate path) would read stale
+			 * bytes past the written prefix, splicing garbage into the
+			 * injected literal (seen live: '0'a1f600-8a1a-...). */
+			if (eo >= sizeof(inj[ninj].expr))
+				eo = sizeof(inj[ninj].expr) - 1;
+			inj[ninj].expr[eo] = '\0';
 		}
 		ninj++;
 	}

@@ -93,7 +93,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.16"
+#define TNT_VERSION	"1.0.17"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -2090,6 +2090,19 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 						}
 					}
 					switch_mutex_unlock(glob->cache_mutex);
+				} else {
+					/* uncacheable statement (a literal payload over
+					 * TNT_SQL_VAL_MAX - e.g. the recovery metadata XML -,
+					 * more than TNT_SQL_VALS_MAX literals, a marker byte in
+					 * the source) or OOM: tpl_in holds a PARTIAL template
+					 * (or garbage) and must NEVER be used as a template
+					 * below - drop both buffers and fall through to the
+					 * raw translate path, which executes the statement
+					 * verbatim. */
+					free(tpl_in);
+					tpl_in = NULL;
+					free(vals);
+					vals = NULL;
 				}
 			}
 

@@ -24,7 +24,7 @@
          split/translate/quote; invalidated on every reload of the rules).
          false = bypass + clear (kill-switch). Hot-togglable with
          'tarantool cache on|off'. -->
-    <param name="cache" value="false"/>
+    <param name="cache" value="true"/>
     <!-- Shared circuit breaker (per-host, keyed by addr:port; global across
          all profiles/pools). Protects the FreeSWITCH core from tight
          retry loops when a Tarantool host goes down.
@@ -78,7 +78,7 @@
          Default: "true".
          init-sql: arbitrary SQL executed right after connect ("" = none).
          ============================================================ -->
-    <profile name="local" version="3.2" skip-index="false">
+    <profile name="local" version="3.2" skip-index="true">
       <param name="unix-socket" value="/run/tarantool/socket/tarantool-socket.control"/>
       <!-- <param name="host" value="127.0.0.1"/>
       <param name="port" value="3301"/> -->
@@ -92,7 +92,7 @@
            2.11 (no box.prepare) the statement transparently falls back to
            the plain path. Runtime override until reconnect:
            'tarantool prepare on|off'. -->
-      <param name="prepare" value="false"/>
+      <param name="prepare" value="true"/>
       <!-- Connection pool: how many independent connections this handle
            keeps (1..8). Statements are distributed round-robin; each
            connection has its own failover state and prepared-statement
@@ -156,8 +156,18 @@
 
   <!-- Declare an existing column as the PRIMARY KEY when translating CREATE TABLE. -->
   <primaryKey>
-    <param table="channels" field="uuid"/>
-    <param table="recovery" field="uuid"/>
+    <param table="channels">
+      <fields>
+        <field name="uuid"/>
+        <field name="hostname"/>
+      </fields>
+    </param>
+    <param table="recovery">
+      <fields>
+        <field name="uuid"/>
+        <field name="hostname"/>
+      </fields>
+    </param>
     <param table="sip_authentication" field="nonce"/>
   </primaryKey>
 
@@ -213,6 +223,13 @@
     <param table="interfaces" field="switch_uuid" type="varchar(36)" isNull="false" value="$${switch_uuid}" in-line="true"/>
     <param table="interfaces" field="switchs_uuid" type="varchar(36)" isNull="false" value="$${switchs_uuid}"/>
     -->
+    <!-- mod_handoff_takeover v2: per-row claim in the recovery table
+         (promts/HANDOFF/mod_handoff_takeover_spec_v2.md, 4.1).
+         in-line="true" is mandatory: $${switchs_uuid} must be resolved at
+         INSERT time, otherwise the literal string is stored. The rules must
+         be deployed on every node writing to the shared core DB. -->
+    <param table="recovery" field="takeover" type="integer" isNull="false" value="0"/>
+    <param table="recovery" field="switchs_uuid" type="varchar(36)" isNull="false" value="$${switchs_uuid}" in-line="true"/>
     <!-- Example with a native UUID column and a static literal:
     <param table="nat" field="node_id" type="uuid" isNull="false" value="0189a000-0000-7000-8000-000000000000"/>
     -->
@@ -235,6 +252,7 @@
   <intColumns>
     <param table="channels" field="created_epoch" type="INTEGER"/>
     <param table="calls" field="call_created_epoch" type="INTEGER"/>
+    <param table="recovery" field="takeover" type="INTEGER"/>
     <param table="sip_authentication" field="expires" type="INTEGER"/>
   </intColumns>
 
