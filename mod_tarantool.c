@@ -93,7 +93,7 @@ SWITCH_MODULE_DEFINITION(mod_tarantool, mod_tarantool_load, mod_tarantool_shutdo
 
 /* Module version, reported by the 'tarantool version' API command.
  * Bump on every feature release (X.Y.Z). */
-#define TNT_VERSION	"1.0.17"
+#define TNT_VERSION	"1.0.18"
 
 typedef struct tnt_maint_sql {
 	char profile[64];			/* <sql profile="..."> */
@@ -256,6 +256,86 @@ static uint32_t parse_ms(const char *v, uint32_t def)
 	return (uint32_t)atol(v);
 }
 
+/* Parse the skip-index-except CSV ("sd_uuid, sd_sip_from_host, ...") into
+ * p->index_except. Names are trimmed, compared case-insensitively, and
+ * deduplicated; over-long names and entries past TNT_INDEX_EXCEPT_MAX are
+ * dropped with a WARNING (never silently truncated). */
+static void parse_index_except(tnt_profile_cfg_t *p, const char *csv)
+{
+	const char *s = csv;
+
+	while (s && *s) {
+		const char *e;
+		size_t n;
+		char nm[TNT_INDEX_NAME_LEN];
+		int i, dup = 0;
+
+		while (*s == ',' || isspace((unsigned char)*s))
+			s++;
+		if (!*s)
+			break;
+		e = s;
+		while (*e && *e != ',')
+			e++;
+		n = (size_t)(e - s);
+		while (n > 0 && isspace((unsigned char)s[n - 1]))
+			n--;
+		if (n == 0) {
+			s = *e ? e + 1 : e;
+			continue;
+		}
+		if (n >= sizeof(nm)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "mod_tarantool: profile '%s': skip-index-except entry longer "
+							  "than %d chars ignored\n",
+							  p->name[0] ? p->name : "(unnamed)", TNT_INDEX_NAME_LEN - 1);
+			s = *e ? e + 1 : e;
+			continue;
+		}
+		memcpy(nm, s, n);
+		nm[n] = '\0';
+		for (i = 0; i < p->nindex_except; i++) {
+			if (!strcasecmp(p->index_except[i], nm)) {
+				dup = 1;
+				break;
+			}
+		}
+		if (dup) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "mod_tarantool: profile '%s': duplicate skip-index-except "
+							  "entry '%s' ignored\n",
+							  p->name[0] ? p->name : "(unnamed)", nm);
+		} else if (p->nindex_except >= TNT_INDEX_EXCEPT_MAX) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "mod_tarantool: profile '%s': skip-index-except limit %d reached, "
+							  "remaining entries ignored\n",
+							  p->name[0] ? p->name : "(unnamed)", TNT_INDEX_EXCEPT_MAX);
+			break;
+		} else {
+			snprintf(p->index_except[p->nindex_except], TNT_INDEX_NAME_LEN, "%s", nm);
+			p->nindex_except++;
+		}
+		s = *e ? e + 1 : e;
+	}
+	if (p->nindex_except == 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "mod_tarantool: profile '%s': skip-index-except has no valid names\n",
+						  p->name[0] ? p->name : "(unnamed)");
+	}
+}
+
+/* 1 when the index name is listed in skip-index-except (case-insensitive). */
+static int profile_index_allowed(const tnt_profile_cfg_t *p, const char *name)
+{
+	int i;
+
+	for (i = 0; i < p->nindex_except; i++) {
+		if (!strcasecmp(p->index_except[i], name))
+			return 1;
+	}
+	return 0;
+}
+
 /* parse a host block (either inline profile params or a <host> child) */
 static void parse_host_params(switch_xml_t xml, tnt_host_cfg_t *h,
 							  uint32_t *query_timeout, char *user, size_t user_len,
@@ -360,6 +440,15 @@ static void parse_profile(switch_xml_t xml, tnt_profile_cfg_t *p)
 			p->full_scan = parse_bool_attr(pv, 1);
 		else if (!strcasecmp(pn, "init-sql"))
 			snprintf(p->init_sql, sizeof(p->init_sql), "%s", pv);
+		else if (!strcasecmp(pn, "skip-index-except"))
+			parse_index_except(p, pv);
+	}
+
+	if (p->nindex_except > 0 && !p->skip_index) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "mod_tarantool: profile '%s': skip-index-except has no effect "
+						  "(skip-index=\"false\")\n",
+						  p->name[0] ? p->name : "(unnamed)");
 	}
 
 	/* inline form: params directly on <profile> */
@@ -2001,13 +2090,36 @@ static switch_status_t tnt_exec_statements(tnt_handle_t *h,
 		s = pick_session(h, &sidx);
 		switch_mutex_lock(h->conn_locks[sidx]);
 
-		/* skip-index=true: never run CREATE INDEX — indexes are managed
-		 * manually (e.g. composite ones for JOINs). */
+		/* skip-index=true: CREATE INDEX is suppressed except for the names
+		 * listed in skip-index-except. A listed UNIQUE index is still NOT
+		 * executed: a duplicate key in existing data would abort the core
+		 * schema init, so it is reported with a WARNING (full statement
+		 * text) and the installer creates it manually after checking. */
 		if (h->profile.skip_index && stmts[i].type == TNT_STMT_CREATE_INDEX) {
+			char idx_name[TNT_INDEX_NAME_LEN];
+			int idx_unique = 0;
+			int allow = 0;
+
+			if (tnt_sql_create_index_info(stmts[i].sql, stmts[i].start, stmts[i].end,
+										  idx_name, sizeof(idx_name), &idx_unique) == 0) {
+				allow = profile_index_allowed(&h->profile, idx_name);
+			}
+			if (allow && idx_unique) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "mod_tarantool: skipping CREATE UNIQUE INDEX (skip-index-except): "
+								  "[%.*s] - create it manually after checking for duplicates\n",
+								  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
+				goto stmt_cont;
+			}
+			if (!allow) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "mod_tarantool: skipping CREATE INDEX (skip-index=true): [%.*s]\n",
+								  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
+				goto stmt_cont;
+			}
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
-							  "mod_tarantool: skipping CREATE INDEX (skip-index=true): [%.*s]\n",
+							  "mod_tarantool: creating INDEX (skip-index-except): [%.*s]\n",
 							  (int)(stmts[i].end - stmts[i].start), stmts[i].sql + stmts[i].start);
-			goto stmt_cont;
 		}
 
 		/* per-statement translation context: fresh core UUIDv7 + global
@@ -2629,6 +2741,12 @@ static void api_print_profile(switch_stream_handle_t *stream, const tnt_profile_
 	stream->write_function(stream, "  hosts: %d, pool-size: %d, user: %s, skip-index: %s, full-scan: %s\n",
 						   p->nhosts, p->pool_size, p->username, p->skip_index ? "true" : "false",
 						   p->full_scan ? "true" : "false");
+	if (p->nindex_except > 0) {
+		stream->write_function(stream, "  skip-index-except: %d [", p->nindex_except);
+		for (i = 0; i < p->nindex_except; i++)
+			stream->write_function(stream, "%s%s", i ? ", " : "", p->index_except[i]);
+		stream->write_function(stream, "]\n");
+	}
 	if (p->init_sql[0])
 		stream->write_function(stream, "  init-sql: %s\n", p->init_sql);
 	for (i = 0; i < p->nhosts; i++) {

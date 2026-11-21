@@ -140,6 +140,13 @@ SWITCH_DECLARE(int) tnt_sql_rebuild(const char *tpl, const tnt_sql_val_t *vals,
  * success, -1 when the output does not fit (cap includes the NUL). */
 SWITCH_DECLARE(int) tnt_sql_tpl_qmarks(const char *tpl, char *out, size_t cap);
 
+/* Parse "CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> (...)":
+ * fills name (lowercased, NUL-terminated) and *is_unique. Used by the
+ * skip-index-except policy. Returns 0 on success, -1 when the statement is
+ * not a well-formed CREATE INDEX (then name is "" and *is_unique is 0). */
+SWITCH_DECLARE(int) tnt_sql_create_index_info(const char *sql, size_t start, size_t end,
+											  char *name, size_t name_cap, int *is_unique);
+
 /* Detect data literals in the SELECT list of a statement template, i.e.
  * marker bytes before the first FROM keyword. Tarantool SQL cannot type
  * anonymous '?' parameters in the SELECT list (PREPARE fails with

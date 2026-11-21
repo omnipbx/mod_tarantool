@@ -16,7 +16,7 @@ PostgreSQL.
 
 ---
 
-## Возможности (v1.0.17)
+## Возможности (v1.0.18)
 
 - **Регистрация как Core DB**: полный набор из 10 колбеков
   `switch_database_interface_t` (`handle_new`/`destroy`, `exec_detailed`,
@@ -44,6 +44,10 @@ PostgreSQL.
   принимают до 4 полей (`TNT_PK_FIELDS_MAX`); поле без `type` только участвует
   в PK-клаузе — его колонка есть в DDL ядра или добавляется `<addField>`, и
   значение для такого поля модуль не генерирует.
+- **Исключения `skip-index`** (v1.0.18): `<param name="skip-index-except"
+  value="sd_uuid,..."/>` — при `skip-index="true"` перечисленные индексы
+  создаются (идемпотентно); `CREATE UNIQUE INDEX` из списка подавляется с
+  WARNING и полным текстом для ручного создания.
 - **Батч-запросы**: SQL вида `stmt1;stmt2;...` (типично для mod_sofia)
   разбивается корректным сплиттером (строки `''`, комментарии, скобки) и
   выполняется последовательно.
@@ -352,6 +356,7 @@ Tarantool: `2.10` или `3.2`) и `skip-index` (игнорирование inde
 | Атрибут | Описание |
 |---|---|
 | `skip-index` | `true` — подавлять все `CREATE INDEX`, поступающие от ядра FreeSWITCH/mod_sofia (индексами управляете вручную, например составными для JOIN); `false` (по умолчанию) — транслировать как обычно |
+| `skip-index-except` | **v1.0.18**, только при `skip-index="true"`: CSV-список имён индексов, которые всё равно **создаются** (`CREATE INDEX IF NOT EXISTS`, идемпотентно). Имена уникальны в БД профиля — `table` не нужен; сравнение без учёта регистра; до 32 имён по 64 символа, дубли/переполнение — WARNING. `CREATE UNIQUE INDEX` из списка **никогда не выполняется автоматически** — пишется WARNING с полным текстом запроса, индекс создаёт инсталлятор вручную (дубли в данных сорвали бы инициализацию схемы). Список при `skip-index="false"` игнорируется с WARNING |
 
 Пример (одиночный хост, unix-socket):
 
@@ -367,6 +372,19 @@ Tarantool: `2.10` или `3.2`) и `skip-index` (игнорирование inde
   <!-- <param name="pool-size" value="4"/> -->
 </profile>
 ```
+
+Пример `skip-index` с исключениями (рекомендуемый стартовый набор индексов mod_sofia):
+
+```xml
+<profile name="local" version="3.2" skip-index="true">
+  ...
+  <param name="skip-index-except"
+         value="sd_uuid,sd_sip_from_host,sd_sip_to_host,sd_sip_from_user,sd_call_id,sr_sip_user,sr_sip_host,sr_call_id,ss_sip_user,ss_sip_host,sp_sip_user,sp_sip_host"/>
+</profile>
+```
+
+Полный каталог индексов mod_sofia (по живому логу подавления) и обоснование набора — в разделе
+[«Транслятор DDL»](#транслятор-ddl) и в `conf/tarantool.conf.xml`.
 
 Пример (failover, мастер через сокет + TCP-реплика):
 
@@ -766,9 +784,40 @@ view из-за усечения — после исправления разме
 - `IF NOT EXISTS` / `IF EXISTS` → удаляются (Tarantool их отвергает);
 - `CREATE INDEX` → приводится к виду с `IF NOT EXISTS`;
 - при `skip-index="true"` на профиле — все `CREATE INDEX` от ядра/mod_sofia
-  подавляются полностью (журналируются как info), индексами нужно управлять
+  подавляются (журналируются как info), **кроме** имён из
+  `skip-index-except` (v1.0.18): они создаются штатно (`IF NOT EXISTS`,
+  повторный вызов безопасен). `CREATE UNIQUE INDEX` из списка не выполняется
+  автоматически — WARNING с полным текстом, создание вручную. Индексами,
+  не попавшими в список, нужно управлять
   вручную (например, составными для JOIN-запросов); PK-инъекция
-  (`primaryKey`/`primaryKeyAdd`) при этом продолжает работать;
+  (`primaryKey`/`primaryKeyAdd`) при этом продолжает работать.
+
+#### Индексы mod_sofia (каталог для `skip-index-except`)
+
+По живому логу подавления (`skip-index="true"`): 72 индекса, 7 таблиц.
+
+| Таблица | Индексы |
+|---|---|
+| `sip_registrations` (20) | `sr_call_id`, `sr_sip_user`, `sr_sip_host`, `sr_sub_host`, `sr_mwi_user`, `sr_mwi_host`, `sr_profile_name`, `sr_presence_hosts`, `sr_contact`, `sr_expires`, `sr_ping_expires`, `sr_hostname`, `sr_status`, `sr_ping_status`, `sr_network_ip`, `sr_network_port`, `sr_sip_username`, `sr_sip_realm`, `sr_orig_server_host`, `sr_orig_hostname` |
+| `sip_subscriptions` (18) | `ss_call_id`, `ss_multi` (call_id, profile_name, hostname), `ss_hostname`, `ss_network_ip`, `ss_sip_user`, `ss_sip_host`, `ss_presence_hosts`, `ss_event`, `ss_proto`, `ss_sub_to_user`, `ss_sub_to_host`, `ss_expires`, `ss_orig_proto`, `ss_network_port`, `ss_profile_name`, `ss_version`, `ss_full_from`, `ss_contact` |
+| `sip_dialogs` (14) | `sd_uuid`, `sd_hostname`, `sd_presence_data`, `sd_call_info`, `sd_call_info_state`, `sd_expires`, `sd_rcd`, `sd_sip_to_tag`, `sd_sip_from_user`, `sd_sip_from_host`, `sd_sip_to_host`, `sd_presence_id`, `sd_call_id`, `sd_sip_from_tag` |
+| `sip_presence` (6) | `sp_hostname`, `sp_open_closed`, `sp_sip_user`, `sp_sip_host`, `sp_profile_name`, `sp_expires` |
+| `sip_authentication` (4) | `sa_nonce`, `sa_hostname`, `sa_expires`, `sa_last_nc` |
+| `sip_shared_appearance_subscriptions` (5) | `ssa_hostname`, `ssa_network_ip`, `ssa_subscriber`, `ssa_profile_name`, `ssa_aor` |
+| `sip_shared_appearance_dialogs` (5) | `ssd_profile_name`, `ssd_hostname`, `ssd_contact_str`, `ssd_call_id`, `ssd_expires` |
+
+**Рекомендуемый стартовый набор** (диалоги — по uuid/участникам/call_id,
+регистрации — sip_user/sip_host/call_id, подписки — sip_user/sip_host,
+presence — sip_user/sip_host):
+
+```
+sd_uuid,sd_sip_from_host,sd_sip_to_host,sd_sip_from_user,sd_call_id,
+sr_sip_user,sr_sip_host,sr_call_id,ss_sip_user,ss_sip_host,
+sp_sip_user,sp_sip_host
+```
+
+Опциональные кандидаты при медленных запросах: `sd_sip_from_tag`,
+`sd_sip_to_tag`, `ss_multi`, `*_hostname` (мультинодовые выборки), `sa_nonce`.
 - «benign»-ошибки (`already exists`, `duplicate key`) маппятся в успех;
   `Space X does not exist` — только для идемпотентных батчей из
   `DROP`/`CREATE INDEX`; для данных (SELECT/DELETE/INSERT/UPDATE) она

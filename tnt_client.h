@@ -80,6 +80,15 @@ typedef struct tnt_host_cfg {
 								 * overrides the profile default) */
 } tnt_host_cfg_t;
 
+/* skip-index-except: index names that are still CREATED when skip-index is
+ * true. Index names are unique per database (the profile targets exactly one
+ * database), so no table qualification is needed. CREATE UNIQUE INDEX is
+ * never executed automatically: it is reported with a WARNING (a unique
+ * index on duplicate data would abort the core schema init) and the
+ * installer creates it manually. */
+#define TNT_INDEX_EXCEPT_MAX	32
+#define TNT_INDEX_NAME_LEN		64
+
 /* A profile is an independent connection pool keyed by DSN name
  * (tarantool://<name>). Contains an ordered failover host list. */
 typedef struct tnt_profile_cfg {
@@ -94,6 +103,8 @@ typedef struct tnt_profile_cfg {
 	uint32_t ping_timeout_s;		/* PING wait before declaring suspect */
 	uint32_t backoff_max_s;			/* cap for exponential backoff */
 	int skip_index;					/* 1 = suppress CREATE INDEX (indexes managed manually) */
+	char index_except[TNT_INDEX_EXCEPT_MAX][TNT_INDEX_NAME_LEN];
+	int nindex_except;				/* skip-index-except: names still created (non-unique) */
 	int full_scan;					/* 1 = run SET SESSION sql_full_scan=true (2.11/3.x)
 									   or sql_seq_scan=true (older 2.x) on every connect */
 	int prepare;					/* default for hosts without their own

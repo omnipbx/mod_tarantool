@@ -946,6 +946,73 @@ SWITCH_DECLARE(int) tnt_sql_tpl_qmarks(const char *tpl, char *out, size_t cap)
 	return 0;
 }
 
+/* Read the next word at *pos, skipping whitespace and comments. Both bare
+ * and double-quoted identifiers are accepted (parse_ident strips the
+ * quotes); callers lowercase the result where needed. Returns 0 on
+ * success, -1 when no identifier starts there. */
+static int tnt_sql_next_word(const char *s, size_t len, size_t *pos,
+							 char *out, size_t outsz)
+{
+	size_t p = skip_ws(s, len, *pos);
+
+	if (p >= len || (!is_ident_start(s[p]) && s[p] != '"'))
+		return -1;
+	parse_ident(s, len, &p, out, outsz);
+	*pos = p;
+	return 0;
+}
+
+SWITCH_DECLARE(int) tnt_sql_create_index_info(const char *sql, size_t start, size_t end,
+											  char *name, size_t name_cap, int *is_unique)
+{
+	size_t p;
+	char w[80];
+
+	if (is_unique)
+		*is_unique = 0;
+	if (!sql || !name || name_cap == 0 || start >= end)
+		return -1;
+	name[0] = '\0';
+
+	p = start;
+	if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)) || strcmp(w, "create"))
+		return -1;
+	if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)))
+		return -1;
+	if (!strcmp(w, "unique")) {
+		if (is_unique)
+			*is_unique = 1;
+		if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)))
+			return -1;
+	}
+	if (strcmp(w, "index"))
+		return -1;
+	if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)))
+		return -1;
+	if (!strcmp(w, "if")) {
+		if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)) || strcmp(w, "not"))
+			return -1;
+		if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)) || strcmp(w, "exists"))
+			return -1;
+		if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)))
+			return -1;
+	}
+	/* w holds the (lowercased) index name; a quoted identifier keeps its
+	 * case in parse_ident, so normalise for the whitelist comparison */
+	{
+		size_t i;
+
+		for (i = 0; w[i]; i++)
+			w[i] = (char)tolower((unsigned char)w[i]);
+	}
+	if (!w[0])
+		return -1;
+	snprintf(name, name_cap, "%s", w);
+	if (tnt_sql_next_word(sql, end, &p, w, sizeof(w)) || strcmp(w, "on"))
+		return -1;
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* SELECT-list literal materialization (PREPARE typing workaround)     */
 /* ------------------------------------------------------------------ */

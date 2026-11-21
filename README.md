@@ -17,7 +17,7 @@ FreeSWITCH itself.
 
 ---
 
-## Features (v1.0.17)
+## Features (v1.0.18)
 
 - **Core DB registration**: the full set of 10 `switch_database_interface_t`
   callbacks (`handle_new`/`destroy`, `exec_detailed`, `exec_string`,
@@ -46,6 +46,10 @@ FreeSWITCH itself.
   up to 4 fields (`TNT_PK_FIELDS_MAX`); a field without `type` only
   participates in the PK clause — its column exists in the core DDL or comes
   from `<addField>`, and the module never generates a value for it.
+- **`skip-index` exceptions** (v1.0.18): `<param name="skip-index-except"
+  value="sd_uuid,..."/>` — with `skip-index="true"` the listed indexes are
+  still created (idempotently); a listed `CREATE UNIQUE INDEX` is suppressed
+  with a WARNING and the full statement text for manual creation.
 - **Batch queries**: SQL of the form `stmt1;stmt2;...` (typical for mod_sofia)
   is split by a correct splitter (string literals `''`, comments, parens) and
   executed sequentially.
@@ -356,6 +360,7 @@ Profile attribute:
 | Attribute | Description |
 |---|---|
 | `skip-index` | `true` — suppress all `CREATE INDEX` coming from the FreeSWITCH core/mod_sofia (indexes are managed manually, e.g. composite ones for JOINs); `false` (default) — translate as usual |
+| `skip-index-except` | **v1.0.18**, only with `skip-index="true"`: CSV list of index names that ARE still created (`CREATE INDEX IF NOT EXISTS`, idempotent). Names are unique per database (the profile targets one database), so no `table` is needed; comparison is case-insensitive; up to 32 names of 64 chars, duplicates/overflow — WARNING. A listed `CREATE UNIQUE INDEX` is **never executed automatically** — a WARNING with the full statement text is logged and the installer creates it manually (duplicate data would abort the schema init). The list is ignored with a WARNING when `skip-index="false"` |
 
 Example (single host, unix-socket):
 
@@ -371,6 +376,20 @@ Example (single host, unix-socket):
   <!-- <param name="pool-size" value="4"/> -->
 </profile>
 ```
+
+`skip-index` with exceptions (recommended starter set of mod_sofia indexes):
+
+```xml
+<profile name="local" version="3.2" skip-index="true">
+  ...
+  <param name="skip-index-except"
+         value="sd_uuid,sd_sip_from_host,sd_sip_to_host,sd_sip_from_user,sd_call_id,sr_sip_user,sr_sip_host,sr_call_id,ss_sip_user,ss_sip_host,sp_sip_user,sp_sip_host"/>
+</profile>
+```
+
+The full mod_sofia index catalogue (from a live suppression log) and the rationale
+behind the set are in the [«DDL translator»](#ddl-translator) section and in
+`conf/tarantool.conf.xml`.
 
 Example (failover, master via socket + TCP replica):
 
@@ -781,9 +800,40 @@ working one stays, CRIT/WARNING is written to the console. Then:
 - `IF NOT EXISTS` / `IF EXISTS` → removed (Tarantool rejects them);
 - `CREATE INDEX` → normalized to the `IF NOT EXISTS` form;
 - with `skip-index="true"` on the profile — all `CREATE INDEX` from the
-  core/mod_sofia are suppressed entirely (logged as info); indexes must be
-  managed manually (e.g. composite ones for JOIN queries); PK injection
-  (`primaryKey`/`primaryKeyAdd`) keeps working;
+  core/mod_sofia are suppressed (logged as info), **except** the names listed
+  in `skip-index-except` (v1.0.18): they are created normally
+  (`IF NOT EXISTS`, idempotent). A listed `CREATE UNIQUE INDEX` is not
+  executed automatically — a WARNING with the full statement text is logged
+  and the index is created manually. Unlisted indexes must be managed
+  manually (e.g. composite ones for JOIN queries); PK injection
+  (`primaryKey`/`primaryKeyAdd`) keeps working.
+
+#### mod_sofia indexes (catalogue for `skip-index-except`)
+
+From a live suppression log: 72 indexes over 7 tables.
+
+| Table | Indexes |
+|---|---|
+| `sip_registrations` (20) | `sr_call_id`, `sr_sip_user`, `sr_sip_host`, `sr_sub_host`, `sr_mwi_user`, `sr_mwi_host`, `sr_profile_name`, `sr_presence_hosts`, `sr_contact`, `sr_expires`, `sr_ping_expires`, `sr_hostname`, `sr_status`, `sr_ping_status`, `sr_network_ip`, `sr_network_port`, `sr_sip_username`, `sr_sip_realm`, `sr_orig_server_host`, `sr_orig_hostname` |
+| `sip_subscriptions` (18) | `ss_call_id`, `ss_multi` (call_id, profile_name, hostname), `ss_hostname`, `ss_network_ip`, `ss_sip_user`, `ss_sip_host`, `ss_presence_hosts`, `ss_event`, `ss_proto`, `ss_sub_to_user`, `ss_sub_to_host`, `ss_expires`, `ss_orig_proto`, `ss_network_port`, `ss_profile_name`, `ss_version`, `ss_full_from`, `ss_contact` |
+| `sip_dialogs` (14) | `sd_uuid`, `sd_hostname`, `sd_presence_data`, `sd_call_info`, `sd_call_info_state`, `sd_expires`, `sd_rcd`, `sd_sip_to_tag`, `sd_sip_from_user`, `sd_sip_from_host`, `sd_sip_to_host`, `sd_presence_id`, `sd_call_id`, `sd_sip_from_tag` |
+| `sip_presence` (6) | `sp_hostname`, `sp_open_closed`, `sp_sip_user`, `sp_sip_host`, `sp_profile_name`, `sp_expires` |
+| `sip_authentication` (4) | `sa_nonce`, `sa_hostname`, `sa_expires`, `sa_last_nc` |
+| `sip_shared_appearance_subscriptions` (5) | `ssa_hostname`, `ssa_network_ip`, `ssa_subscriber`, `ssa_profile_name`, `ssa_aor` |
+| `sip_shared_appearance_dialogs` (5) | `ssd_profile_name`, `ssd_hostname`, `ssd_contact_str`, `ssd_call_id`, `ssd_expires` |
+
+**Recommended starter set** (dialogs by uuid/participants/call_id, registrations
+by sip_user/sip_host/call_id, subscriptions by sip_user/sip_host, presence by
+sip_user/sip_host):
+
+```
+sd_uuid,sd_sip_from_host,sd_sip_to_host,sd_sip_from_user,sd_call_id,
+sr_sip_user,sr_sip_host,sr_call_id,ss_sip_user,ss_sip_host,
+sp_sip_user,sp_sip_host
+```
+
+Optional candidates for slow queries: `sd_sip_from_tag`, `sd_sip_to_tag`,
+`ss_multi`, `*_hostname` (multi-node selects), `sa_nonce`.
 - "benign" errors (`already exists`, `duplicate key`) are mapped to success;
   `Space X does not exist` — only for idempotent batches of
   `DROP`/`CREATE INDEX`; for data (SELECT/DELETE/INSERT/UPDATE) it must reach

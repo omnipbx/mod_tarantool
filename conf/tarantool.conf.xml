@@ -67,6 +67,36 @@
          skip-index="true" suppresses every CREATE INDEX issued by the
          FreeSWITCH core / mod_sofia (indexes are then managed manually,
          e.g. composite ones required by JOINs). Default: "false".
+         skip-index-except="a,b,c" (PROFILE-LEVEL, skip-index must be
+         "true") keeps the listed index names: they ARE created
+         (CREATE INDEX IF NOT EXISTS, idempotent). CREATE UNIQUE INDEX is
+         NEVER executed automatically - it is logged with a WARNING and the
+         full statement text so the installer can create it manually after
+         checking for duplicates. Names are CSV, case-insensitive, max 32
+         entries; names are unique per database, so no table is needed.
+         mod_sofia indexes (from a live skip log):
+           sip_registrations: sr_call_id, sr_sip_user, sr_sip_host,
+             sr_sub_host, sr_mwi_user, sr_mwi_host, sr_profile_name,
+             sr_presence_hosts, sr_contact, sr_expires, sr_ping_expires,
+             sr_hostname, sr_status, sr_ping_status, sr_network_ip,
+             sr_network_port, sr_sip_username, sr_sip_realm,
+             sr_orig_server_host, sr_orig_hostname
+           sip_subscriptions: ss_call_id, ss_multi, ss_hostname,
+             ss_network_ip, ss_sip_user, ss_sip_host, ss_presence_hosts,
+             ss_event, ss_proto, ss_sub_to_user, ss_sub_to_host,
+             ss_expires, ss_orig_proto, ss_network_port, ss_profile_name,
+             ss_version, ss_full_from, ss_contact
+           sip_dialogs: sd_uuid, sd_hostname, sd_presence_data,
+             sd_call_info, sd_call_info_state, sd_expires, sd_rcd,
+             sd_sip_to_tag, sd_sip_from_user, sd_sip_from_host,
+             sd_sip_to_host, sd_presence_id, sd_call_id, sd_sip_from_tag
+           sip_presence: sp_hostname, sp_open_closed, sp_sip_user,
+             sp_sip_host, sp_profile_name, sp_expires
+           sip_authentication: sa_nonce, sa_hostname, sa_expires, sa_last_nc
+           sip_shared_appearance_subscriptions: ssa_hostname,
+             ssa_network_ip, ssa_subscriber, ssa_profile_name, ssa_aor
+           sip_shared_appearance_dialogs: ssd_profile_name, ssd_hostname,
+             ssd_contact_str, ssd_call_id, ssd_expires
          full-scan and init-sql are PROFILE-LEVEL parameters: they apply to
          EVERY host of the profile (single-host and <hosts> alike, incl.
          failover reconnects) and must be placed directly on <profile>,
@@ -102,6 +132,12 @@
       <param name="connect-timeout" value="2000"/>
       <param name="query-timeout" value="3000"/>
       <param name="full-scan" value="true"/>
+      <!-- Indexes kept when skip-index="true" (recommended starter set):
+           dialog lookups (uuid/participants/call_id), registration lookups
+           (sip_user/sip_host/call_id), subscription lookups (sip_user/
+           sip_host) and presence status (sip_user/sip_host). Add/remove
+           names per your traffic; UNIQUE indexes are never auto-created. -->
+      <param name="skip-index-except" value="sd_uuid,sd_sip_from_host,sd_sip_to_host,sd_sip_from_user,sd_call_id,sr_sip_user,sr_sip_host,sr_call_id,ss_sip_user,ss_sip_host,sp_sip_user,sp_sip_host"/>
       <!-- <param name="init-sql" value="SET SESSION sql_full_scan=true"/> -->
 
       <!-- ========================================================
@@ -230,6 +266,7 @@
          be deployed on every node writing to the shared core DB. -->
     <param table="recovery" field="takeover" type="integer" isNull="false" value="0"/>
     <param table="recovery" field="switchs_uuid" type="varchar(36)" isNull="false" value="$${switchs_uuid}" in-line="true"/>
+    <param table="recovery" field="source_switchs_uuid" type="varchar(36)" isNull="false" value="$${switchs_uuid}" in-line="true"/>
     <!-- Example with a native UUID column and a static literal:
     <param table="nat" field="node_id" type="uuid" isNull="false" value="0189a000-0000-7000-8000-000000000000"/>
     -->
