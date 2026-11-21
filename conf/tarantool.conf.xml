@@ -147,6 +147,17 @@
            failover applies to SELECT only; transactions stick to
            one host. The 'role' attribute (master|replica|any) is a
            v1.1 extension and is ignored in v1.
+
+           IMPORTANT: <hosts> is a failover list of INDEPENDENT
+           Tarantool instances, not a cluster. DDL (CREATE TABLE /
+           CREATE INDEX / DROP / ALTER) and all DML run on the ACTIVE
+           host only; neither the schema nor the data is replicated.
+           For Multi-Master the required schema (tables, PKs, indexes
+           incl. skip-index-except) MUST be provisioned manually on
+           every <hosts> member. Automatic schema creation on all
+           members is deferred until master/replica roles land
+           (DDL/DML on master, SELECT from replicas). For a real HA
+           cluster use Tarantool replication (box.cfg{replication=...}).
            ========================================================
       <hosts>
         <host name="master-sock" version="3.2">

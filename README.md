@@ -424,6 +424,32 @@ Example (failover, master via socket + TCP replica):
 </profile>
 ```
 
+#### Multi-host (`<hosts>`) limitations — DDL runs on the active host only
+
+`<hosts>` is a **failover list of independent Tarantool instances**, not a
+cluster: the module replicates neither the schema nor the data. Each session
+has exactly one active connection (the first live host), and **every**
+statement — including `CREATE TABLE`, `CREATE INDEX`, `DROP`/`ALTER` — runs on
+that host only. Switching happens on network failures only; after a switch the
+FreeSWITCH core performs a reactive probe and recreates the schema **on the new
+host** (the log shows `Space 'x' does not exist` until it is recreated), but:
+
+- **the data stays on the previous host** — there is no synchronisation
+  between `<hosts>` members;
+- **the schema is not created on the other `<hosts>` members automatically**.
+
+For **Multi-Master** (several independent Tarantool instances with
+manual/emergency failover) the required database schema — tables, PKs and
+indexes (including `skip-index-except`) — **must be provisioned manually on
+every `<hosts>` member** before FreeSWITCH starts. Automatic schema creation
+on all `<hosts>` members is deferred until the **master/replica** role support
+lands (DDL/DML on the master only, `SELECT` from replicas — see the v1.1
+roadmap).
+
+For a true HA cluster use Tarantool's own **replication**
+(`box.cfg{replication=...}`): the server replicates both the schema and the
+data, and `<hosts>` remains just a list of addresses to reconnect to.
+
 > ⚠️ **Important**: in v1 `tls-profile` and the `<tls>` section are **only a
 > stub** — they are parsed and stored in the configuration but do **NOT
 > activate encryption**: the connection is always established over an
