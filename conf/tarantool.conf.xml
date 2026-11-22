@@ -37,6 +37,18 @@
     <param name="cb-mode" value="wait"/>
     <param name="cb-failure-threshold" value="3"/>
     <param name="cb-timeout" value="5000"/>
+    <!-- SELECT of custom functions (v1.0.19): "SELECT my_func()" and
+         "SELECT my_func(a, b)" are passed through (cache/prepared/raw) and
+         work without any module-side registration. The function itself must
+         be created in Tarantool with param_list, e.g.:
+           box.schema.func.create('my_func', {
+             language = 'LUA', param_list = {'integer','string'},
+             returns = 'string', is_sandboxed = true,
+             body = "function(a, b) return b .. a end" })
+         Name must be lower-case (SQL folds unquoted identifiers); SELECT is
+         retryable, so the function must be read-only/idempotent. If the
+         server returns data without IPROTO_METADATA, columns COLUMN_1..N are
+         synthesized so values still reach the core. -->
   </settings>
 
   <!-- TLS client profiles.

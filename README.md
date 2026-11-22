@@ -17,7 +17,7 @@ FreeSWITCH itself.
 
 ---
 
-## Features (v1.0.18)
+## Features (v1.0.19)
 
 - **Core DB registration**: the full set of 10 `switch_database_interface_t`
   callbacks (`handle_new`/`destroy`, `exec_detailed`, `exec_string`,
@@ -50,6 +50,13 @@ FreeSWITCH itself.
   value="sd_uuid,..."/>` — with `skip-index="true"` the listed indexes are
   still created (idempotently); a listed `CREATE UNIQUE INDEX` is suppressed
   with a WARNING and the full statement text for manual creation.
+- **`SELECT` of custom functions** (v1.0.19): `SELECT my_func()` and
+  `SELECT my_func(a, b)` (literal arguments) work through the template cache,
+  prepared and raw paths; when the server returns data without
+  `IPROTO_METADATA` (a SELECT with no table), columns `COLUMN_1..N` are
+  synthesized so values are not lost. The function must be created in
+  Tarantool with `param_list` (see
+  [«SELECT of custom functions»](#select-of-custom-functions-v1019)).
 - **Batch queries**: SQL of the form `stmt1;stmt2;...` (typical for mod_sofia)
   is split by a correct splitter (string literals `''`, comments, parens) and
   executed sequentially.
@@ -871,6 +878,52 @@ Optional candidates for slow queries: `sd_sip_from_tag`, `sd_sip_to_tag`,
   without recompiling the module (see below);
 - function DEFAULTs (`DEFAULT uuid()`, `DEFAULT uuid7()`) are not emitted in
   DDL: Tarantool 3.x parses them but does not evaluate them on INSERT.
+
+### SELECT of custom functions (v1.0.19)
+
+`SELECT my_func()` and `SELECT my_func(<param1>, <param2>)` are supported on
+every execution path:
+
+- **template cache**: `select my_func(?, ?)` — one template for all argument
+  sets, values are substituted on rebuild;
+- **prepared**: literals in the SELECT list are materialized into constants
+  (Tarantool cannot type `?` in a SELECT list), the function stays in the
+  template;
+- **raw**: uncacheable statements (argument over 512 bytes) are sent as-is;
+- **result without `IPROTO_METADATA`** (typical for a SELECT with no table):
+  the module synthesizes `COLUMN_1..N` columns (type `any`), so the values are
+  not dropped and reach the core callback.
+
+Requirements on the Tarantool side (the module does not create functions):
+
+```lua
+box.schema.func.create('my_func', {
+    language     = 'LUA',
+    param_list   = {'integer', 'string'},   -- REQUIRED for SQL calls
+    returns      = 'string',
+    is_sandboxed = true,
+    body         = "function(a, b) return b .. a end"
+})
+```
+
+| Requirement | Why |
+|---|---|
+| `param_list` | without it SQL calls are rejected ("Function 'x' does not support SQL calls") |
+| **lower-case** name | SQL folds unquoted identifiers to lower case, while Lua `_func` names are case-sensitive |
+| `is_sandboxed = true` or `execute` granted to the profile user | otherwise "Execute access denied" |
+| scalar return value | a table/array in a SELECT list is a Tarantool error |
+| read-only / idempotent | `SELECT` is retryable: the module repeats it after a network failure |
+
+Example:
+
+```sql
+SELECT my_func(1, 'x');
+SELECT my_func();
+```
+
+Limitations: the function name must not collide with reserved words (`uuid`,
+`alias` — they get quoted); literal arguments longer than `TNT_SQL_VAL_MAX`
+(512) make the statement uncacheable (it still runs via the raw path).
 
 ---
 

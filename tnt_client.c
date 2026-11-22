@@ -1570,6 +1570,36 @@ static int parse_response(tnt_conn_t *c, tnt_result_t *res)
 		goto out;
 	}
 
+	/* SELECT without a table (e.g. SELECT custom_function(1, 'x')) may come
+	 * back with IPROTO_DATA but no IPROTO_METADATA map. fill_result() copies
+	 * only c < ncols, so with ncols == 0 the returned values would be
+	 * silently dropped and the core callback would see argc == 0.
+	 * Synthesize columns from the row width (COLUMN_1..N, type "any"). */
+	if (ncols == 0 && nraw > 0) {
+		size_t w = 0, r;
+		int ci;
+
+		for (r = 0; r < nraw; r++) {
+			if (raw[r].n > w)
+				w = raw[r].n;
+		}
+		if (w > 256)
+			w = 256;	/* cols[] capacity */
+		for (ci = 0; ci < (int)w; ci++) {
+			char nm[32];
+
+			snprintf(nm, sizeof(nm), "COLUMN_%d", ci + 1);
+			cols[ci].name = dup_str(nm, strlen(nm));
+			cols[ci].type = dup_str("any", 3);
+			if (!cols[ci].name || !cols[ci].type) {
+				conn_seterr(c, "out of memory synthesizing result columns");
+				ret = -1;
+				goto out;
+			}
+		}
+		ncols = (int)w;
+	}
+
 	if (fill_result(res, cols, ncols, raw, (int)nraw, affected) < 0) {
 		conn_seterr(c, "out of memory filling result");
 		ret = -1;
